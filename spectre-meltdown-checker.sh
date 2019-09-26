@@ -1782,7 +1782,7 @@ if [ "$opt_live" = 1 ]; then
 	if [ ! -e "$opt_kernel" ]; then
 		# Fedora:
 		[ -e "/lib/modules/$(uname -r)/vmlinuz" ] && opt_kernel="/lib/modules/$(uname -r)/vmlinuz"
-		# Slackare:
+		# Slackware:
 		[ -e "/boot/vmlinuz"             ] && opt_kernel="/boot/vmlinuz"
 		# Arch aarch64:
 		[ -e "/boot/Image"               ] && opt_kernel="/boot/Image"
@@ -1908,7 +1908,7 @@ else
 		if [ "$opt_live" = 1 ]; then
 			_verbose "Kernel image is \033[35m$kernel_version"
 			if ! echo "$kernel_version" | grep -qF "$(uname -r)"; then
-				_warn "Possible disrepancy between your running kernel '$(uname -r)' and the image '$kernel_version' we found ($opt_kernel), results might be incorrect"
+				_warn "Possible discrepancy between your running kernel '$(uname -r)' and the image '$kernel_version' we found ($opt_kernel), results might be incorrect"
 			fi
 		else
 			_info "Kernel image is \033[35m$kernel_version"
@@ -2071,8 +2071,6 @@ read_msr()
 		_debug "read_msr: MOCKING enabled for msr $_msr, returning $read_msr_value"
 		mocked=1
 		return 0
-	else
-		mockme=$(printf "%b\n%b" "$mockme" "SMC_MOCK_RDMSR_${_msr}='$read_msr_value'")
 	fi
 
 	_mockvarname="SMC_MOCK_RDMSR_${_msr}_RET"
@@ -2121,7 +2119,10 @@ read_msr()
 			mockme=$(printf "%b\n%b" "$mockme" "SMC_MOCK_RDMSR_${_msr}_RET=1")
 			return 1
 		fi
+	# remove sparse spaces od might give us
+	read_msr_value=$(( read_msr_value ))
 	fi
+	mockme=$(printf "%b\n%b" "$mockme" "SMC_MOCK_RDMSR_${_msr}='$read_msr_value'")
 	_debug "read_msr: MSR=$_msr value is $read_msr_value"
 	return 0
 }
@@ -2461,7 +2462,7 @@ check_cpu()
 	fi
 
 	if is_intel; then
-		_info "  * Microarchitecture Data Sampling"
+		_info "  * Microarchitectural Data Sampling"
 		_info_nol "    * VERW instruction is available: "
 		read_cpuid 0x7 $EDX 10 1 1; ret=$?
 		if [ $ret -eq 0 ]; then
@@ -2999,10 +3000,19 @@ check_CVE_2017_5715_linux()
 					ibrs_fw_enabled=1
 				fi
 				# when IBRS is enabled on 4.15+, we can see it in sysfs
+				# on a more recent kernel, classic "IBRS" is not even longer an option, because of the performance impact.
+				# only "Enhanced IBRS" is available (on CPUs with the IBRS_ALL flag)
 				if echo "$fullmsg" | grep -q -e '\<IBRS\>' -e 'Indirect Branch Restricted Speculation'; then
 					_debug "ibrs: found IBRS in sysfs"
 					[ -z "$ibrs_supported" ] && ibrs_supported='found IBRS in sysfs'
 					[ -z "$ibrs_enabled"   ] && ibrs_enabled=3
+				fi
+				# checking for 'Enhanced IBRS' in sysfs, enabled on CPUs with IBRS_ALL
+				if echo "$fullmsg" | grep -q -e 'Enhanced IBRS'; then
+					[ -z "$ibrs_supported" ] && ibrs_supported='found Enhanced IBRS in sysfs'
+					# 4 isn't actually a valid value of the now extinct "ibrs_enabled" flag file,
+					# that only went from 0 to 3, so we use 4 as "enhanced ibrs is enabled"
+					ibrs_enabled=4
 				fi
 			fi
 			# in live mode, if ibrs or ibpb is supported and we didn't find these are enabled, then they are not
@@ -3055,8 +3065,10 @@ check_CVE_2017_5715_linux()
 			if [ "$ibrs_can_tell" = 1 ]; then
 				pstatus yellow NO
 			else
-				# if we're in offline mode without System.map, we can't really know
-				pstatus yellow UNKNOWN "in offline mode, we need the kernel image and System.map to be able to tell"
+				# problem obtaining/inspecting kernel or strings not installed, but if the later is true,
+				# then readelf is not installed either (both in binutils) which makes the former true, so
+				# either way kernel_err should be set
+				pstatus yellow UNKNOWN "couldn't check ($kernel_err)"
 			fi
 		else
 			if [ "$opt_verbose" -ge 2 ]; then
@@ -3076,6 +3088,7 @@ check_CVE_2017_5715_linux()
 				# 1 is enabled only for kernel space
 				# 2 is enabled for kernel and user space
 				# 3 is enabled
+				# 4 is enhanced ibrs enabled
 				case "$ibrs_enabled" in
 					0)
 						if [ "$ibrs_fw_enabled" = 1 ]; then
@@ -3087,6 +3100,7 @@ check_CVE_2017_5715_linux()
 					1)	if [ "$ibrs_fw_enabled" = 1 ]; then pstatus green YES "for kernel space and firmware code"; else pstatus green YES "for kernel space"; fi;;
 					2)	if [ "$ibrs_fw_enabled" = 1 ]; then pstatus green YES "for kernel, user space, and firmware code" ; else pstatus green YES "for both kernel and user space"; fi;;
 					3)	if [ "$ibrs_fw_enabled" = 1 ]; then pstatus green YES "for kernel and firmware code"; else pstatus green YES; fi;;
+					4)	pstatus green YES "Enhanced flavor, performance impact will be greatly reduced";;
 					*)	if [ "$cpuid_ibrs" != 'SPEC_CTRL' ] && [ "$cpuid_ibrs" != 'IBRS_SUPPORT' ] && [ "$cpuid_spec_ctrl" != -1 ]; 
 							then pstatus yellow NO; _debug "ibrs: known cpu not supporting SPEC-CTRL or IBRS"; 
 						else 
@@ -3265,8 +3279,8 @@ check_CVE_2017_5715_linux()
 			_info_nol "  * Kernel supports RSB filling: "
 			if ! command -v "${opt_arch_prefix}strings" >/dev/null 2>&1; then
 				pstatus yellow UNKNOWN "missing '${opt_arch_prefix}strings' tool, please install it, usually it's in the binutils package"
-			elif [ -z "$kernel" ]; then
-				pstatus yellow UNKNOWN "kernel image missing"
+			elif [ -n "$kernel_err" ]; then
+				pstatus yellow UNKNOWN "couldn't check ($kernel_err)"
 			else
 				rsb_filling=$("${opt_arch_prefix}strings" "$kernel" | grep -w 'Filling RSB on context switch')
 				if [ -n "$rsb_filling" ]; then
@@ -3297,7 +3311,11 @@ check_CVE_2017_5715_linux()
 				_warn "IBPB is considered as a good addition to retpoline for Variant 2 mitigation, but your CPU microcode doesn't support it"
 			fi
 		elif [ -n "$ibrs_enabled" ] && [ -n "$ibpb_enabled" ] && [ "$ibrs_enabled" -ge 1 ] && [ "$ibpb_enabled" -ge 1 ]; then
-			pvulnstatus $cve OK "IBRS + IBPB are mitigating the vulnerability"
+			if [ "$ibrs_enabled" = 4 ]; then
+				pvulnstatus $cve OK "Enhanced IBRS + IBPB are mitigating the vulnerability"
+			else
+				pvulnstatus $cve OK "IBRS + IBPB are mitigating the vulnerability"
+			fi
 		elif [ "$ibpb_enabled" = 2 ] && ! is_cpu_smt_enabled; then
 			pvulnstatus $cve OK "Full IBPB is mitigating the vulnerability"
 		elif [ -n "$bp_harden" ]; then
@@ -4056,7 +4074,7 @@ check_CVE_2018_3620_linux()
 		# if msg is empty, sysfs check didn't fill it, rely on our own test
 		if [ "$pteinv_supported" = 1 ]; then
 			if [ "$pteinv_active" = 1 ] || [ "$opt_live" != 1 ]; then
-				pvulnstatus $cve OK "PTE inversion mitigates the vunerability"
+				pvulnstatus $cve OK "PTE inversion mitigates the vulnerability"
 			else
 				pvulnstatus $cve VULN "Your kernel supports PTE inversion but it doesn't seem to be enabled"
 			fi
@@ -4517,9 +4535,9 @@ check_mds_linux()
 	sys_interface_available=0
 	msg=''
 	if sys_interface_check "/sys/devices/system/cpu/vulnerabilities/mds" '^[^;]+'; then
-		# this kernel has the /sys interface, trust it over everything
 		sys_interface_available=1
 	fi
+
 	if [ "$opt_sysfs_only" != 1 ]; then
 		_info_nol "* Kernel supports using MD_CLEAR mitigation: "
 		kernel_md_clear=''
@@ -4574,44 +4592,60 @@ check_mds_linux()
 	if ! is_cpu_vulnerable "$cve"; then
 		# override status & msg in case CPU is not vulnerable after all
 		pvulnstatus "$cve" OK "your CPU vendor reported your CPU model as not vulnerable"
-	elif [ -z "$msg" ]; then
-		# if msg is empty, sysfs check didn't fill it, rely on our own test
-		if [ "$cpuid_md_clear" = 1 ]; then
-			if [ -n "$kernel_md_clear" ]; then
-				if [ "$opt_live" = 1 ]; then
-					# mitigation must also be enabled
-					if [ "$mds_mitigated" = 1 ]; then
-						if [ "$opt_paranoid" != 1 ] || [ "$mds_smt_mitigated" = 1 ]; then
-							pvulnstatus "$cve" OK "Your microcode and kernel are both up to date for this mitigation, and mitigation is enabled"
+	else
+		if [ "$opt_sysfs_only" != 1 ]; then
+			# compute mystatus and mymsg from our own logic
+			if [ "$cpuid_md_clear" = 1 ]; then
+				if [ -n "$kernel_md_clear" ]; then
+					if [ "$opt_live" = 1 ]; then
+						# mitigation must also be enabled
+						if [ "$mds_mitigated" = 1 ]; then
+							if [ "$opt_paranoid" != 1 ] || [ "$mds_smt_mitigated" = 1 ]; then
+								mystatus=OK
+								mymsg="Your microcode and kernel are both up to date for this mitigation, and mitigation is enabled"
+							else
+								mystatus=VULN
+								mymsg="Your microcode and kernel are both up to date for this mitigation, but your must disable SMT (Hyper-Threading) for a complete mitigation"
+							fi
 						else
-							pvulnstatus "$cve" VULN "Your microcode and kernel are both up to date for this mitigation, but your must disable SMT (Hyper-Threading) for a complete mitigation"
+							mystatus=VULN
+							mymsg="Your microcode and kernel are both up to date for this mitigation, but the mitigation is not active"
 						fi
 					else
-						pvulnstatus "$cve" VULN "Your microcode and kernel are both up to date for this mitigation, but the mitigation is not active"
+						mystatus=OK
+						mymsg="Your microcode and kernel are both up to date for this mitigation"
 					fi
 				else
-					pvulnstatus "$cve" OK "Your microcode and kernel are both up to date for this mitigation"
+					mystatus=VULN
+					mymsg="Your microcode supports mitigation, but your kernel doesn't, upgrade it to mitigate the vulnerability"
 				fi
 			else
-				pvulnstatus "$cve" VULN "Your microcode supports mitigation, but your kernel doesn't, upgrade it to mitigate the vulnerability"
+				if [ -n "$kernel_md_clear" ]; then
+					mystatus=VULN
+					mymsg="Your kernel supports mitigation, but your CPU microcode also needs to be updated to mitigate the vulnerability"
+				else
+					mystatus=VULN
+					mymsg="Neither your kernel or your microcode support mitigation, upgrade both to mitigate the vulnerability"
+				fi
 			fi
 		else
-			if [ -n "$kernel_md_clear" ]; then
-				pvulnstatus "$cve" VULN "Your kernel supports mitigation, but your CPU microcode also needs to be updated to mitigate the vulnerability"
-			else
-				pvulnstatus "$cve" VULN "Neither your kernel or your microcode support mitigation, upgrade both to mitigate the vulnerability"
-			fi
-		fi
-	else
-		if [ "$opt_paranoid" = 1 ]; then
-			# in paranoid mode, we don't only need microcode + kernel update, we also want SMT mitigation
-			if echo "$fullmsg" | grep -qF -e 'SMT mitigated' -e 'SMT disabled'; then
-				pvulnstatus "$cve" OK "$fullmsg"
-			else
-				pvulnstatus "$cve" VULN "Your kernel and microcode partially mitigate the vulnerability, but you must disable SMT (Hyper-Threading) for a complete mitigation"
-			fi
-		else
+			# sysfs only: return the status/msg we got
 			pvulnstatus "$cve" "$status" "$fullmsg"
+			return
+		fi
+
+		# if we didn't get a msg+status from sysfs, use ours
+		if [ -z "$msg" ]; then
+			pvulnstatus "$cve" "$mystatus" "$mymsg"
+		elif [ "$opt_paranoid" = 1 ]; then
+			# if paranoid mode is enabled, we now that we won't agree on status, so take ours
+			pvulnstatus "$cve" "$mystatus" "$mymsg"
+		elif [ "$status" = "$mystatus" ]; then
+			# if we agree on status, we'll print the common status and our message (more detailed than the sysfs one)
+			pvulnstatus "$cve" "$status" "$mymsg"
+		else
+			# if we don't agree on status, maybe our logic is flawed due to a new kernel/mitigation? use the one from sysfs
+			pvulnstatus "$cve" "$status" "$msg"
 		fi
 	fi
 }
