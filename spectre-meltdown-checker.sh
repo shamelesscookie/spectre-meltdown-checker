@@ -41,8 +41,9 @@ show_usage()
 	# shellcheck disable=SC2086
 	cat <<EOF
 	Usage:
-		Live mode:    $(basename $0) [options] [--live]
-		Offline mode: $(basename $0) [options] [--kernel <kernel_file>] [--config <kernel_config>] [--map <kernel_map_file>]
+		Live mode (auto):   $(basename $0) [options]
+		Live mode (manual): $(basename $0) [options] <[--kernel <kimage>] [--config <kconfig>] [--map <mapfile>]> --live
+		Offline mode:       $(basename $0) [options] <[--kernel <kimage>] [--config <kconfig>] [--map <mapfile>]>
 
 	Modes:
 		Two modes are available.
@@ -51,11 +52,15 @@ show_usage()
 		To run under this mode, just start the script without any option (you can also use --live explicitly)
 
 		Second mode is the "offline" mode, where you can inspect a non-running kernel.
-		You'll need to specify the location of the kernel file, config and System.map files:
+		This mode is automatically enabled when you specify the location of the kernel file, config and System.map files:
 
 		--kernel kernel_file	specify a (possibly compressed) Linux or BSD kernel file
 		--config kernel_config	specify a kernel config file (Linux only)
 		--map kernel_map_file	specify a kernel System.map file (Linux only)
+
+		If you want to use live mode while specifying the location of the kernel, config or map file yourself,
+		you can add --live to the above options, to tell the script to run in live mode instead of the offline mode,
+		which is enabled by default when at least one file is specified on the command line.
 
 	Options:
 		--no-color		don't use color codes
@@ -78,7 +83,7 @@ show_usage()
 		--batch prometheus      produce output for consumption by prometheus-node-exporter
 
 		--variant VARIANT	specify which variant you'd like to check, by default all variants are checked
-					VARIANT can be one of 1, 2, 3, 3a, 4, l1tf, msbds, mfbds, mlpds, mdsum
+					VARIANT can be one of 1, 2, 3, 3a, 4, l1tf, msbds, mfbds, mlpds, mdsum, taa
 					can be specified multiple times (e.g. --variant 2 --variant 3)
 		--cve [cve1,cve2,...]	specify which CVE you'd like to check, by default all supported CVEs are checked
 		--hw-only		only check for CPU information, don't check for any variant
@@ -134,8 +139,7 @@ os=$(uname -s)
 opt_kernel=''
 opt_config=''
 opt_map=''
-opt_live_explicit=0
-opt_live=1
+opt_live=-1
 opt_no_color=0
 opt_batch=0
 opt_batch_format='text'
@@ -157,7 +161,7 @@ global_critical=0
 global_unknown=0
 nrpe_vuln=''
 
-supported_cve_list='CVE-2017-5753 CVE-2017-5715 CVE-2017-5754 CVE-2018-3640 CVE-2018-3639 CVE-2018-3615 CVE-2018-3620 CVE-2018-3646 CVE-2018-12126 CVE-2018-12130 CVE-2018-12127 CVE-2019-11091'
+supported_cve_list='CVE-2017-5753 CVE-2017-5715 CVE-2017-5754 CVE-2018-3640 CVE-2018-3639 CVE-2018-3615 CVE-2018-3620 CVE-2018-3646 CVE-2018-12126 CVE-2018-12130 CVE-2018-12127 CVE-2019-11091 CVE-2019-11135'
 
 # find a sane command to print colored messages, we prefer `printf` over `echo`
 # because `printf` behavior is more standard across Linux/BSD
@@ -279,6 +283,7 @@ cve2name()
 		CVE-2018-12130) echo "ZombieLoad, microarchitectural fill buffer data sampling (MFBDS)";;
 		CVE-2018-12127) echo "RIDL, microarchitectural load port data sampling (MLPDS)";;
 		CVE-2019-11091) echo "RIDL, microarchitectural data sampling uncacheable memory (MDSUM)";;
+		CVE-2019-11135) echo "Transactional Synchronization Extensions (TSX) Asynchronous Abort (TAA)";;
 		*) echo "$0: error: invalid CVE '$1' passed to cve2name()" >&2; exit 255;;
 	esac
 }
@@ -300,6 +305,7 @@ _is_cpu_vulnerable_cached()
 		CVE-2018-12130) return $variant_mfbds;;
 		CVE-2018-12127) return $variant_mlpds;;
 		CVE-2019-11091) return $variant_mdsum;;
+		CVE-2019-11135) return $variant_taa;;
 		*) echo "$0: error: invalid variant '$1' passed to is_cpu_vulnerable()" >&2; exit 255;;
 	esac
 }
@@ -326,6 +332,7 @@ is_cpu_vulnerable()
 	variant_mfbds=''
 	variant_mlpds=''
 	variant_mdsum=''
+	variant_taa=''
 
 	if is_cpu_mds_free; then
 		[ -z "$variant_msbds" ] && variant_msbds=immune
@@ -333,6 +340,11 @@ is_cpu_vulnerable()
 		[ -z "$variant_mlpds" ] && variant_mlpds=immune
 		[ -z "$variant_mdsum" ] && variant_mdsum=immune
 		_debug "is_cpu_vulnerable: cpu not affected by Microarchitectural Data Sampling"
+	fi
+
+	if is_cpu_taa_free; then
+		[ -z "$variant_taa" ] && variant_taa=immune
+		_debug "is_cpu_vulnerable: cpu not affected by TSX Asynhronous Abort"
 	fi
 
 	if is_cpu_specex_free; then
@@ -346,6 +358,7 @@ is_cpu_vulnerable()
 		variant_mfbds=immune
 		variant_mlpds=immune
 		variant_mdsum=immune
+		variant_taa=immune
 	elif is_intel; then
 		# Intel
 		# https://github.com/crozone/SpectrePoC/issues/1 ^F E5200 => spectre 2 not vulnerable
@@ -528,6 +541,7 @@ is_cpu_vulnerable()
 	[ "$variant_mfbds" = "immune" ] && variant_mfbds=1 || variant_mfbds=0
 	[ "$variant_mlpds" = "immune" ] && variant_mlpds=1 || variant_mlpds=0
 	[ "$variant_mdsum" = "immune" ] && variant_mdsum=1 || variant_mdsum=0
+	[ "$variant_taa" = "immune" ] && variant_taa=1 || variant_taa=0
 	variantl1tf_sgx="$variantl1tf"
 	# even if we are vulnerable to L1TF, if there's no SGX, we're safe for the original foreshadow
 	[ "$cpuid_sgx" = 0 ] && variantl1tf_sgx=1
@@ -610,6 +624,26 @@ is_cpu_mds_free()
 	elif [ "$cpu_vendor" = CAVIUM ]; then
 		return 0
 	elif [ "$cpu_vendor" = ARM ]; then
+		return 0
+	fi
+
+	return 1
+}
+
+
+is_cpu_taa_free()
+{
+	# return true (0) if the CPU isn't affected by tsx asynchronous aborts, false (1) if it does.
+	# There are three types of processors that do not require additional mitigations.
+	# 1. CPUs that do not support Intel TSX are not affected.
+	# 2. CPUs that enumerate IA32_ARCH_CAPABILITIES[TAA_NO] (bit 8)=1 are not affected.
+	# 3. CPUs that support Intel TSX and do not enumerate IA32_ARCH_CAPABILITIES[MDS_NO] (bit 5)=1
+	# do not need additional mitigations beyond what is already required to mitigate MDS.
+
+	if ! is_intel; then
+		return 0
+	# is intel
+	elif [ "$capabilities_taa_no" = 0 ] || [ "$cpuid_rtm" = 0 ]; then
 		return 0
 	fi
 
@@ -766,22 +800,19 @@ while [ -n "$1" ]; do
 		opt_kernel=$(parse_opt_file kernel "$2"); ret=$?
 		[ $ret -ne 0 ] && exit 255
 		shift 2
-		opt_live=0
 	elif [ "$1" = "--config" ]; then
 		opt_config=$(parse_opt_file config "$2"); ret=$?
 		[ $ret -ne 0 ] && exit 255
 		shift 2
-		opt_live=0
 	elif [ "$1" = "--map" ]; then
 		opt_map=$(parse_opt_file map "$2"); ret=$?
 		[ $ret -ne 0 ] && exit 255
 		shift 2
-		opt_live=0
 	elif [ "$1" = "--arch-prefix" ]; then
 		opt_arch_prefix="$2"
 		shift 2
 	elif [ "$1" = "--live" ]; then
-		opt_live_explicit=1
+		opt_live=1
 		shift
 	elif [ "$1" = "--no-color" ]; then
 		opt_no_color=1
@@ -885,8 +916,9 @@ while [ -n "$1" ]; do
 			mlpds)  opt_cve_list="$opt_cve_list CVE-2018-12127"; opt_cve_all=0;;
 			mdsum)  opt_cve_list="$opt_cve_list CVE-2019-11091"; opt_cve_all=0;;
 			l1tf)	opt_cve_list="$opt_cve_list CVE-2018-3615 CVE-2018-3620 CVE-2018-3646"; opt_cve_all=0;;
+			taa)	opt_cve_list="$opt_cve_list CVE-2019-11135"; opt_cve_all=0;;
 			*)
-				echo "$0: error: invalid parameter '$2' for --variant, expected either 1, 2, 3, 3a, 4, msbds, mfbds, mlpds, mdsum, or l1tf" >&2;
+				echo "$0: error: invalid parameter '$2' for --variant, expected either 1, 2, 3, 3a, 4, msbds, mfbds, mlpds, mdsum, taa or l1tf" >&2;
 				exit 255
 				;;
 		esac
@@ -921,6 +953,15 @@ fi
 if [ "$opt_no_hw" = 1 ] && [ "$opt_hw_only" = 1 ]; then
 	_warn "Incompatible options specified (--no-hw and --hw-only), aborting"
 	exit 255
+fi
+
+if [ "$opt_live" = -1 ]; then
+	if [ -n "$opt_kernel" ] || [ -n "$opt_config" ] || [ -n "$opt_map" ]; then
+		# no --live specified and we have a least one of the kernel/config/map files on the cmdline: offline mode
+		opt_live=0
+	else
+		opt_live=1
+	fi
 fi
 
 # print status function
@@ -962,6 +1003,7 @@ pvulnstatus()
 			CVE-2018-12130) aka="MFBDS";;
 			CVE-2018-12127) aka="MLPDS";;
 			CVE-2019-11091) aka="MDSUM";;
+			CVE-2019-11135) aka="TAA";;
 			*) echo "$0: error: invalid CVE '$1' passed to pvulnstatus()" >&2; exit 255;;
 		esac
 
@@ -1134,7 +1176,7 @@ mount_debugfs()
 load_msr()
 {
 	if [ "$os" = Linux ]; then
-		if ! grep -e msr "$procfs/modules" 2>/dev/null; then
+		if ! grep -qw msr "$procfs/modules" 2>/dev/null; then
 			modprobe msr 2>/dev/null && insmod_msr=1
 			_debug "attempted to load module msr, insmod_msr=$insmod_msr"
 		else
@@ -1153,7 +1195,7 @@ load_msr()
 load_cpuid()
 {
 	if [ "$os" = Linux ]; then
-		if ! grep -e cpuid "$procfs/modules" 2>/dev/null; then
+		if ! grep -qw cpuid "$procfs/modules" 2>/dev/null; then
 			modprobe cpuid 2>/dev/null && insmod_cpuid=1
 			_debug "attempted to load module cpuid, insmod_cpuid=$insmod_cpuid"
 		else
@@ -1679,6 +1721,23 @@ is_latest_known_ucode()
 	return 2
 }
 
+get_cmdline()
+{
+	if [ -n "$kernel_cmdline" ]; then
+		return
+	fi
+
+	if [ -n "$SMC_MOCK_CMDLINE" ]; then
+		mocked=1
+		_debug "get_cmdline: using mocked cmdline '$SMC_MOCK_CMDLINE'"
+		kernel_cmdline="$SMC_MOCK_CMDLINE"
+		return
+	else
+		kernel_cmdline=$(cat "$procfs/cmdline")
+		mockme=$(printf "%b\n%b" "$mockme" "SMC_MOCK_CMDLINE='$kernel_cmdline'")
+	fi
+}
+
 # ENTRYPOINT
 
 # we can't do anything useful under WSL
@@ -1690,13 +1749,6 @@ if uname -a | grep -qE -- '-Microsoft #[0-9]+-Microsoft '; then
 fi
 
 # check for mode selection inconsistency
-if [ "$opt_live_explicit" = 1 ]; then
-	if [ -n "$opt_kernel" ] || [ -n "$opt_config" ] || [ -n "$opt_map" ]; then
-		show_usage
-		echo "$0: error: incompatible modes specified, use either --live or --kernel/--config/--map" >&2
-		exit 255
-	fi
-fi
 if [ "$opt_hw_only" = 1 ]; then
 	if [ "$opt_cve_all" = 0 ]; then
 		show_usage
@@ -1750,6 +1802,8 @@ if echo "$os" | grep -q BSD; then
 fi
 
 parse_cpu_details
+get_cmdline
+
 if [ "$opt_live" = 1 ]; then
 	# root check (only for live mode, for offline mode, we already checked if we could read the files)
 	if [ "$(id -u)" -ne 0 ]; then
@@ -1763,9 +1817,12 @@ if [ "$opt_live" = 1 ]; then
 	_info "CPU is \033[35m$cpu_friendly_name\033[0m"
 
 	# try to find the image of the current running kernel
+	if [ -n "$opt_kernel" ]; then
+		# specified by user on cmdline, with --live, don't override
+		:
 	# first, look for the BOOT_IMAGE hint in the kernel cmdline
-	if [ -r "$procfs/cmdline" ] && grep -q 'BOOT_IMAGE=' "$procfs/cmdline"; then
-		opt_kernel=$(grep -Eo 'BOOT_IMAGE=[^ ]+' "$procfs/cmdline" | cut -d= -f2)
+	elif echo "$kernel_cmdline" | grep -q 'BOOT_IMAGE='; then
+		opt_kernel=$(echo "$kernel_cmdline" | grep -Eo 'BOOT_IMAGE=[^ ]+' | cut -d= -f2)
 		_debug "found opt_kernel=$opt_kernel in $procfs/cmdline"
 		# if the boot partition is within a btrfs subvolume, strip the subvolume name
 		# if /boot is a separate subvolume, the remainder of the code in this section should handle it
@@ -1808,10 +1865,19 @@ if [ "$opt_live" = 1 ]; then
 		str_uname=$(uname -r)
 		clear_linux_kernel="/lib/kernel/org.clearlinux.${str_uname##*.}.${str_uname%.*}"
 		[ -e "$clear_linux_kernel" ] && opt_kernel=$clear_linux_kernel
+		# Custom Arch seems to have the kernel path in its cmdline in the form "\directory\kernelimage",
+		# with actual \'s instead of /'s:
+		custom_arch_kernel=$(echo "$kernel_cmdline" | grep -Eo "(^|\s)\\\\[\\\\a-zA-Z0-9_.-]+" | tr "\\\\" "/" | tr -d '[:space:]')
+		if [ -n "$custom_arch_kernel" ] && [ -e "$custom_arch_kernel" ]; then
+			opt_kernel="$custom_arch_kernel"
+		fi
 	fi
 
 	# system.map
-	if [ -e "$procfs/kallsyms" ] ; then
+	if [ -n "$opt_map" ]; then
+		# specified by user on cmdline, with --live, don't override
+		:
+	elif [ -e "$procfs/kallsyms" ] ; then
 		opt_map="$procfs/kallsyms"
 	elif [ -e "/lib/modules/$(uname -r)/System.map" ] ; then
 		opt_map="/lib/modules/$(uname -r)/System.map"
@@ -1822,7 +1888,10 @@ if [ "$opt_live" = 1 ]; then
 	fi
 
 	# config
-	if [ -e "$procfs/config.gz" ] ; then
+	if [ -n "$opt_config" ]; then
+		# specified by user on cmdline, with --live, don't override
+		:
+	elif [ -e "$procfs/config.gz" ] ; then
 		dumped_config="$(mktemp /tmp/config-XXXXXX)"
 		gunzip -c "$procfs/config.gz" > "$dumped_config"
 		# dumped_config will be deleted at the end of the script
@@ -2377,7 +2446,7 @@ check_cpu()
 		_info_nol "    * CPU indicates SSBD capability: "
 		read_cpuid 0x80000008 $EBX 24 1 1; ret24=$?
 		read_cpuid 0x80000008 $EBX 25 1 1; ret25=$?
-		
+
 		if [ $ret24 -eq 0 ]; then
 			cpuid_ssbd='HYGON SSBD in SPEC_CTRL'
 			#hygon cpuid_ssbd_spec_ctrl=1
@@ -2478,6 +2547,22 @@ check_cpu()
 	fi
 
 	if is_intel; then
+		_info "  * TSX Asynchronous Abort"
+		_info_nol "    * TSX support is available: "
+		read_cpuid 0x7 $EDX 11 1 1; ret=$?
+		if [ $ret -eq 0 ]; then
+			cpuid_rtm=1
+			pstatus green YES "TSX RTM feature bit"
+		elif [ $ret -eq 2 ]; then
+			cpuid_rtm=-1
+			pstatus yellow UNKNOWN "is cpuid kernel module available?"
+		else
+			cpuid_rtm=0
+			pstatus yellow NO
+		fi
+	fi
+
+	if is_intel; then
 		_info     "  * Enhanced IBRS (IBRS_ALL)"
 		_info_nol "    * CPU indicates ARCH_CAPABILITIES MSR availability: "
 		cpuid_arch_capabilities=-1
@@ -2494,6 +2579,7 @@ check_cpu()
 		fi
 
 		_info_nol "    * ARCH_CAPABILITIES MSR advertises IBRS_ALL capability: "
+		capabilities_taa_no=-1
 		capabilities_mds_no=-1
 		capabilities_rdcl_no=-1
 		capabilities_ibrs_all=-1
@@ -2504,6 +2590,7 @@ check_cpu()
 			pstatus yellow UNKNOWN
 		elif [ "$cpuid_arch_capabilities" != 1 ]; then
 			capabilities_rdcl_no=0
+			capabilities_taa_no=0
 			capabilities_mds_no=0
 			capabilities_ibrs_all=0
 			capabilities_rsba=0
@@ -2536,6 +2623,7 @@ check_cpu()
 			done
 			capabilities=$val_cap_msr
 			capabilities_rdcl_no=0
+			capabilities_taa_no=0
 			capabilities_mds_no=0
 			capabilities_ibrs_all=0
 			capabilities_rsba=0
@@ -2549,7 +2637,8 @@ check_cpu()
 				[ $(( capabilities >> 3 & 1 )) -eq 1 ] && capabilities_l1dflush_no=1
 				[ $(( capabilities >> 4 & 1 )) -eq 1 ] && capabilities_ssb_no=1
 				[ $(( capabilities >> 5 & 1 )) -eq 1 ] && capabilities_mds_no=1
-				_debug "capabilities says rdcl_no=$capabilities_rdcl_no ibrs_all=$capabilities_ibrs_all rsba=$capabilities_rsba l1dflush_no=$capabilities_l1dflush_no ssb_no=$capabilities_ssb_no mds_no=$capabilities_mds_no"
+				[ $(( capabilities >> 8 & 1 )) -eq 1 ] && capabilities_taa_no=1
+				_debug "capabilities says rdcl_no=$capabilities_rdcl_no ibrs_all=$capabilities_ibrs_all rsba=$capabilities_rsba l1dflush_no=$capabilities_l1dflush_no ssb_no=$capabilities_ssb_no mds_no=$capabilities_mds_no taa_no=$capabilities_taa_no"
 				if [ "$capabilities_ibrs_all" = 1 ]; then
 					if [ $cpu_mismatch -eq 0 ]; then
 						pstatus green YES
@@ -2608,6 +2697,15 @@ check_cpu()
 		if [ "$capabilities_mds_no" = -1 ]; then
 			pstatus yellow UNKNOWN
 		elif [ "$capabilities_mds_no" = 1 ]; then
+			pstatus green YES
+		else
+			pstatus yellow NO
+		fi
+
+		_info_nol "  * CPU explicitly indicates not being vulnerable to TSX Asynchrnonous Abort (TAA_NO): "
+		if [ "$capabilities_taa_no" = -1 ]; then
+			pstatus yellow UNKNOWN
+		elif [ "$capabilities_taa_no" = 1 ]; then
 			pstatus green YES
 		else
 			pstatus yellow NO
@@ -3694,7 +3792,7 @@ check_CVE_2017_5754_linux()
 				if [ -n "$kpti_support" ]; then
 					if [ -e "/sys/kernel/debug/x86/pti_enabled" ]; then
 						explain "Your kernel supports PTI but it's disabled, you can enable it with \`echo 1 > /sys/kernel/debug/x86/pti_enabled\`"
-					elif grep -q -w -e nopti -e pti=off "$procfs/cmdline"; then
+					elif echo "$kernel_cmdline" | grep -q -w -e nopti -e pti=off; then
 						explain "Your kernel supports PTI but it has been disabled on command-line, remove the nopti or pti=off option from your bootloader configuration"
 					else
 						explain "Your kernel supports PTI but it has been disabled, check \`dmesg\` right after boot to find clues why the system disabled it"
@@ -4650,6 +4748,100 @@ check_mds_linux()
 	fi
 }
 
+
+###################
+# TAA SECTION
+
+# Transactional Synchronization Extension (TSX) Asynchronous Abort
+check_CVE_2019_11135()
+{
+	cve='CVE-2019-11135'
+	_info "\033[1;34m$cve aka '$(cve2name "$cve")'\033[0m"
+	if [ "$os" = Linux ]; then
+		check_CVE_2019_11135_linux
+	#elif echo "$os" | grep -q BSD; then
+	#	check_CVE_2019_11135_bsd
+	else
+		_warn "Unsupported OS ($os)"
+	fi
+}
+
+check_CVE_2019_11135_linux()
+{
+	status=UNK
+	sys_interface_available=0
+	msg=''
+	if sys_interface_check "/sys/devices/system/cpu/vulnerabilities/tsx_async_abort"; then
+		# this kernel has the /sys interface, trust it over everything
+		sys_interface_available=1
+	fi
+	if [ "$opt_sysfs_only" != 1 ]; then
+		_info_nol "* TAA mitigation is supported by kernel: "
+		kernel_taa=''
+		if [ -n "$kernel_err" ]; then
+			kernel_taa_err="$kernel_err"
+		elif grep -q 'tsx_async_abort' "$kernel"; then
+			kernel_taa="found tsx_async_abort in kernel image"
+		fi
+		if [ -n "$kernel_taa" ]; then
+			pstatus green YES "$kernel_taa"
+		elif [ -n "$kernel_taa_err" ]; then
+			pstatus yellow UNKNOWN "$kernel_taa_err"
+		else
+			pstatus yellow NO
+		fi
+
+		_info_nol "* TAA mitigation enabled and active: "
+		if [ "$opt_live" = 1 ]; then
+			if [ -n "$fullmsg" ]; then
+				if echo "$fullmsg" | grep -qE '^Mitigation'; then
+					pstatus green YES "$fullmsg"
+				else
+					pstatus yellow NO
+				fi
+			else
+				pstatus yellow NO "tsx_async_abort not found in sysfs hierarchy"
+			fi
+		else
+			pstatus blue N/A "not testable in offline mode"
+		fi
+	elif [ "$sys_interface_available" = 0 ]; then
+		# we have no sysfs but were asked to use it only!
+		msg="/sys vulnerability interface use forced, but it's not available!"
+		status=UNK
+	fi
+
+	if ! is_cpu_vulnerable "$cve" ; then
+		# override status & msg in case CPU is not vulnerable after all
+		pvulnstatus "$cve" OK "your CPU vendor reported your CPU model as not vulnerable"
+	elif [ -z "$msg" ]; then
+		# if msg is empty, sysfs check didn't fill it, rely on our own test
+		if [ "$opt_live" = 1 ]; then
+			# if we're in live mode and $msg is empty, sysfs file is not there so kernel is too old
+			pvulnstatus $cve VULN "Your kernel doesn't support TAA mitigation, update it"
+		else
+			if [ -n "$kernel_taa" ]; then
+				pvulnstatus $cve OK "Your kernel supports TAA mitigation"
+			else
+				pvulnstatus $cve VULN "Your kernel doesn't support TAA mitigation, update it"
+			fi
+		fi
+	else
+		if [ "$opt_paranoid" = 1 ]; then
+			# in paranoid mode, TSX or SMT enabled are not OK, even if TAA is mitigated
+			if ! echo "$fullmsg" | grep -qF 'TSX disabled'; then
+				pvulnstatus $cve VULN "TSX must be disabled for full mitigation"
+			elif echo "$fullmsg" | grep -qF 'SMT vulnerable'; then
+				pvulnstatus $cve VULN "SMT (HyperThreading) must be disabled for full mitigation"
+			else
+				pvulnstatus $cve "$status" "$msg"
+			fi
+		else
+			pvulnstatus $cve "$status" "$msg"
+		fi
+	fi
+}
+
 if [ "$opt_no_hw" = 0 ] && [ -z "$opt_arch_prefix" ]; then
 	check_cpu
 	check_cpu_vulnerabilities
@@ -4742,7 +4934,7 @@ exit 0  # ok
 # wget https://github.com/platomav/MCExtractor/raw/master/MCE.db
 # sqlite3 MCE.db "select '%%% MCEDB v'||revision||' - '||strftime('%Y/%m/%d', date, 'unixepoch') from MCE; select '# I,0x'||cpuid||',0x'||version||','||max(yyyymmdd) from Intel group by cpuid order by cpuid asc; select '# A,0x'||cpuid||',0x'||version||','||max(yyyymmdd) from AMD group by cpuid order by cpuid asc"
 
-# %%% MCEDB v112 - 2019/05/22
+# %%% MCEDB v130 - 2019/11/04
 # I,0x00000611,0x00000B27,19961218
 # I,0x00000612,0x000000C6,19961210
 # I,0x00000616,0x000000C6,19961210
@@ -4901,8 +5093,8 @@ exit 0  # ok
 # I,0x000206D2,0x9584020C,20110622
 # I,0x000206D3,0x80000304,20110420
 # I,0x000206D5,0x00000513,20111013
-# I,0x000206D6,0x0000061D,20180508
-# I,0x000206D7,0x00000714,20180508
+# I,0x000206D6,0x0000061F,20190521
+# I,0x000206D7,0x00000718,20190521
 # I,0x000206E0,0xE3493401,20090108
 # I,0x000206E1,0xE3493402,20090224
 # I,0x000206E2,0xFFFF0004,20081001
@@ -4937,7 +5129,7 @@ exit 0  # ok
 # I,0x000306D1,0xFFFF0009,20131015
 # I,0x000306D2,0xFFFF0009,20131219
 # I,0x000306D3,0xE3121338,20140825
-# I,0x000306D4,0x0000002D,20190307
+# I,0x000306D4,0x0000002E,20190613
 # I,0x000306E0,0x00000008,20120726
 # I,0x000306E2,0x0000020D,20130321
 # I,0x000306E3,0x00000308,20130321
@@ -4948,13 +5140,13 @@ exit 0  # ok
 # I,0x000306F1,0x00000014,20140110
 # I,0x000306F2,0x00000043,20190301
 # I,0x000306F3,0x0000000D,20160211
-# I,0x000306F4,0x00000014,20190301
+# I,0x000306F4,0x00000016,20190617
 # I,0x00040650,0xFFFF000B,20121206
 # I,0x00040651,0x00000025,20190226
 # I,0x00040660,0xFFFF0011,20121012
 # I,0x00040661,0x0000001B,20190226
 # I,0x00040670,0xFFFF0006,20140304
-# I,0x00040671,0x00000020,20190307
+# I,0x00040671,0x00000021,20190613
 # I,0x000406A0,0x80124001,20130521
 # I,0x000406A8,0x0000081F,20140812
 # I,0x000406A9,0x0000081F,20140812
@@ -4966,35 +5158,35 @@ exit 0  # ok
 # I,0x000406D8,0x0000012A,20180104
 # I,0x000406E1,0x00000020,20141111
 # I,0x000406E2,0x0000002C,20150521
-# I,0x000406E3,0x000000CC,20190401
+# I,0x000406E3,0x000000D4,20190814
 # I,0x000406E8,0x00000026,20160414
 # I,0x000406F0,0x00000014,20150702
-# I,0x000406F1,0x0B000036,20190302
+# I,0x000406F1,0x0B000038,20190618
 # I,0x00050650,0x8000002B,20160208
 # I,0x00050651,0x8000002B,20160208
 # I,0x00050652,0x80000037,20170502
 # I,0x00050653,0x01000146,20180824
-# I,0x00050654,0x0200005E,20190402
-# I,0x00050655,0x03000010,20181116
-# I,0x00050656,0x04000024,20190407
-# I,0x00050657,0x05000024,20190407
+# I,0x00050654,0x02000065,20190905
+# I,0x00050655,0x03000012,20190412
+# I,0x00050656,0x0400002C,20190905
+# I,0x00050657,0x0500002C,20190905
 # I,0x00050661,0xF1000008,20150130
-# I,0x00050662,0x0000001A,20190323
-# I,0x00050663,0x07000017,20190323
-# I,0x00050664,0x0F000015,20190323
-# I,0x00050665,0x0E00000D,20190323
+# I,0x00050662,0x0000001C,20190617
+# I,0x00050663,0x07000019,20190617
+# I,0x00050664,0x0F000017,20190617
+# I,0x00050665,0x0E00000F,20190617
 # I,0x00050670,0xFFFF0030,20151113
 # I,0x00050671,0x000001B6,20180108
 # I,0x000506A0,0x00000038,20150112
 # I,0x000506C2,0x00000014,20180511
 # I,0x000506C8,0x90011010,20160323
-# I,0x000506C9,0x00000038,20190115
-# I,0x000506CA,0x00000016,20190301
+# I,0x000506C9,0x0000003C,20190722
+# I,0x000506CA,0x0000001A,20190722
 # I,0x000506D1,0x00000102,20150605
 # I,0x000506E0,0x00000018,20141119
 # I,0x000506E1,0x0000002A,20150602
 # I,0x000506E2,0x0000002E,20150815
-# I,0x000506E3,0x000000CC,20190401
+# I,0x000506E3,0x000000D4,20190814
 # I,0x000506E8,0x00000034,20160710
 # I,0x000506F0,0x00000010,20160607
 # I,0x000506F1,0x0000002E,20190321
@@ -5002,23 +5194,27 @@ exit 0  # ok
 # I,0x00060661,0x0000000E,20170128
 # I,0x00060662,0x00000022,20171129
 # I,0x00060663,0x0000002A,20180417
+# I,0x000606E1,0x00000108,20190423
 # I,0x000706A0,0x00000026,20170712
-# I,0x000706A1,0x0000002E,20190102
-# I,0x000706E0,0x0000002A,20180528
-# I,0x000706E1,0x00000040,20190327
-# I,0x000706E2,0x00000040,20190327
-# I,0x000706E4,0x0000001A,20190403
-# I,0x000706E5,0x0000001E,20190420
+# I,0x000706A1,0x00000032,20190828
+# I,0x000706A8,0x00000016,20190829
+# I,0x000706E0,0x0000002C,20180614
+# I,0x000706E1,0x00000042,20190420
+# I,0x000706E2,0x00000042,20190420
+# I,0x000706E4,0x00000036,20190718
+# I,0x000706E5,0x00000050,20191027
 # I,0x00080650,0x00000018,20180108
-# I,0x000806E9,0x000000B4,20190401
-# I,0x000806EA,0x000000B4,20190401
-# I,0x000806EB,0x000000B8,20190330
-# I,0x000806EC,0x000000B8,20190330
-# I,0x000906E9,0x000000B4,20190401
-# I,0x000906EA,0x000000B4,20190401
-# I,0x000906EB,0x000000B4,20190401
-# I,0x000906EC,0x000000AE,20190214
-# I,0x000906ED,0x000000BC,20190513
+# I,0x000806E9,0x000000C8,20191003
+# I,0x000806EA,0x000000C6,20190814
+# I,0x000806EB,0x000000C6,20190814
+# I,0x000806EC,0x000000C6,20190814
+# I,0x000906E9,0x000000C6,20190814
+# I,0x000906EA,0x000000C6,20190814
+# I,0x000906EB,0x000000C6,20190814
+# I,0x000906EC,0x000000C6,20190814
+# I,0x000906ED,0x000000C6,20190814
+# I,0x000A0650,0x000000AE,20190410
+# I,0x000A0660,0x000000C6,20190827
 # A,0x00000F00,0x02000008,20070614
 # A,0x00000F01,0x0000001C,20021031
 # A,0x00000F10,0x00000003,20020325
@@ -5087,13 +5283,17 @@ exit 0  # ok
 # A,0x00800F00,0x0800002A,20161006
 # A,0x00800F10,0x0800100C,20170131
 # A,0x00800F11,0x08001138,20190204
-# A,0x00800F12,0x08001230,20180804
-# A,0x00800F82,0x0800820C,20190204
+# A,0x00800F12,0x08001250,20190416
+# A,0x00800F82,0x0800820D,20190416
 # A,0x00810F00,0x08100004,20161120
-# A,0x00810F10,0x08101014,20190307
+# A,0x00810F10,0x08101016,20190430
 # A,0x00810F11,0x08101102,20181106
 # A,0x00810F80,0x08108002,20180605
-# A,0x00810F81,0x08108102,20180813
+# A,0x00810F81,0x08108109,20190417
 # A,0x00820F00,0x08200002,20180214
+# A,0x00820F01,0x08200103,20190417
+# A,0x00830F00,0x08300027,20190401
+# A,0x00830F10,0x08301025,20190711
+# A,0x00860F00,0x08600004,20190620
 # A,0x00870F00,0x08700004,20181206
-# A,0x00870F10,0x08701011,20190415
+# A,0x00870F10,0x08701013,20190611
