@@ -11,7 +11,7 @@
 #
 # Stephane Lesimple
 #
-VERSION='0.42'
+VERSION='0.43'
 
 trap 'exit_cleanup' EXIT
 trap '_warn "interrupted, cleaning up..."; exit_cleanup; exit 1' INT
@@ -22,6 +22,7 @@ exit_cleanup()
 	[ -n "$kerneltmp"     ] && [ -f "$kerneltmp"     ] && rm -f "$kerneltmp"
 	[ -n "$kerneltmp2"    ] && [ -f "$kerneltmp2"    ] && rm -f "$kerneltmp2"
 	[ -n "$mcedb_tmp"     ] && [ -f "$mcedb_tmp"     ] && rm -f "$mcedb_tmp"
+	[ -n "$intel_tmp"     ] && [ -d "$intel_tmp"     ] && rm -rf "$intel_tmp"
 	[ "$mounted_debugfs" = 1 ] && umount /sys/kernel/debug 2>/dev/null
 	[ "$mounted_procfs"  = 1 ] && umount "$procfs" 2>/dev/null
 	[ "$insmod_cpuid"    = 1 ] && rmmod cpuid 2>/dev/null
@@ -83,14 +84,15 @@ show_usage()
 		--batch prometheus      produce output for consumption by prometheus-node-exporter
 
 		--variant VARIANT	specify which variant you'd like to check, by default all variants are checked
-					VARIANT can be one of 1, 2, 3, 3a, 4, l1tf, msbds, mfbds, mlpds, mdsum, taa
+					VARIANT can be one of 1, 2, 3, 3a, 4, l1tf, msbds, mfbds, mlpds, mdsum, taa, mcepsc
 					can be specified multiple times (e.g. --variant 2 --variant 3)
 		--cve [cve1,cve2,...]	specify which CVE you'd like to check, by default all supported CVEs are checked
 		--hw-only		only check for CPU information, don't check for any variant
 		--no-hw			skip CPU information and checks, if you're inspecting a kernel not to be run on this host
-		--vmm [auto,yes,no]	override the detection of the presence of a hypervisor (for CVE-2018-3646), default: auto
-		--update-mcedb		update our local copy of the CPU microcodes versions database (from the awesome MCExtractor project)
-		--update-builtin-mcedb	same as --update-mcedb but update builtin DB inside the script itself
+		--vmm [auto,yes,no]	override the detection of the presence of a hypervisor, default: auto
+		--update-fwdb		update our local copy of the CPU microcodes versions database (using the awesome
+					MCExtractor project and the Intel firmwares GitHub repository)
+		--update-builtin-fwdb	same as --update-fwdb but update builtin DB inside the script itself
 		--dump-mock-data	used to mimick a CPU on an other system, mainly used to help debugging this script
 
 	Return codes:
@@ -161,7 +163,7 @@ global_critical=0
 global_unknown=0
 nrpe_vuln=''
 
-supported_cve_list='CVE-2017-5753 CVE-2017-5715 CVE-2017-5754 CVE-2018-3640 CVE-2018-3639 CVE-2018-3615 CVE-2018-3620 CVE-2018-3646 CVE-2018-12126 CVE-2018-12130 CVE-2018-12127 CVE-2019-11091 CVE-2019-11135'
+supported_cve_list='CVE-2017-5753 CVE-2017-5715 CVE-2017-5754 CVE-2018-3640 CVE-2018-3639 CVE-2018-3615 CVE-2018-3620 CVE-2018-3646 CVE-2018-12126 CVE-2018-12130 CVE-2018-12127 CVE-2019-11091 CVE-2019-11135 CVE-2018-12207'
 
 # find a sane command to print colored messages, we prefer `printf` over `echo`
 # because `printf` behavior is more standard across Linux/BSD
@@ -283,7 +285,8 @@ cve2name()
 		CVE-2018-12130) echo "ZombieLoad, microarchitectural fill buffer data sampling (MFBDS)";;
 		CVE-2018-12127) echo "RIDL, microarchitectural load port data sampling (MLPDS)";;
 		CVE-2019-11091) echo "RIDL, microarchitectural data sampling uncacheable memory (MDSUM)";;
-		CVE-2019-11135) echo "Transactional Synchronization Extensions (TSX) Asynchronous Abort (TAA)";;
+		CVE-2019-11135) echo "ZombieLoad V2, TSX Asynchronous Abort (TAA)";;
+		CVE-2018-12207) echo "No eXcuses, iTLB Multihit, machine check exception on page size changes (MCEPSC)";;
 		*) echo "$0: error: invalid CVE '$1' passed to cve2name()" >&2; exit 255;;
 	esac
 }
@@ -306,6 +309,7 @@ _is_cpu_vulnerable_cached()
 		CVE-2018-12127) return $variant_mlpds;;
 		CVE-2019-11091) return $variant_mdsum;;
 		CVE-2019-11135) return $variant_taa;;
+		CVE-2018-12207) return $variant_itlbmh;;
 		*) echo "$0: error: invalid variant '$1' passed to is_cpu_vulnerable()" >&2; exit 255;;
 	esac
 }
@@ -333,6 +337,7 @@ is_cpu_vulnerable()
 	variant_mlpds=''
 	variant_mdsum=''
 	variant_taa=''
+	variant_itlbmh=''
 
 	if is_cpu_mds_free; then
 		[ -z "$variant_msbds" ] && variant_msbds=immune
@@ -388,11 +393,20 @@ is_cpu_vulnerable()
 			[ -z "$variant4" ] && variant4=immune
 			_debug "is_cpu_vulnerable: cpu not affected by speculative store bypass so not vuln to variant4"
 		fi
-		# variant 4a for xeon phi
+		# variant 3a
 		if [ "$cpu_family" = 6 ]; then
 			if [ "$cpu_model" = "$INTEL_FAM6_XEON_PHI_KNL" ] || [ "$cpu_model" = "$INTEL_FAM6_XEON_PHI_KNM" ]; then
 				_debug "is_cpu_vulnerable: xeon phi immune to variant 3a"
 				[ -z "$variant3a" ] && variant3a=immune
+			elif [ "$cpu_model" = "$INTEL_FAM6_ATOM_SILVERMONT" ] || \
+				[ "$cpu_model" = "$INTEL_FAM6_ATOM_SILVERMONT_MID" ] || \
+				[ "$cpu_model" = "$INTEL_FAM6_ATOM_SILVERMONT_D" ]; then
+					# https://www.intel.com/content/www/us/en/security-center/advisory/intel-sa-00115.html
+					# https://github.com/speed47/spectre-meltdown-checker/issues/310
+					# => silvermont CPUs (aka cherry lake for tablets and brawsell for mobile/desktop) don't seem to be vulnerable
+					# => goldmont ARE vulnerable
+					_debug "is_cpu_vulnerable: silvermont immune to variant 3a"
+					[ -z "$variant3a" ] && variant3a=immune
 			fi
 		fi
 		# L1TF (RDCL_NO already checked above)
@@ -404,23 +418,25 @@ is_cpu_vulnerable()
 				[ "$cpu_model" = "$INTEL_FAM6_ATOM_BONNELL_MID" ] || \
 				[ "$cpu_model" = "$INTEL_FAM6_ATOM_SILVERMONT" ] || \
 				[ "$cpu_model" = "$INTEL_FAM6_ATOM_SILVERMONT_MID" ] || \
-				[ "$cpu_model" = "$INTEL_FAM6_ATOM_SILVERMONT_X" ] || \
+				[ "$cpu_model" = "$INTEL_FAM6_ATOM_SILVERMONT_D" ] || \
 				[ "$cpu_model" = "$INTEL_FAM6_ATOM_AIRMONT" ] || \
 				[ "$cpu_model" = "$INTEL_FAM6_ATOM_AIRMONT_MID" ] || \
+				[ "$cpu_model" = "$INTEL_FAM6_ATOM_AIRMONT_NP" ] || \
 				[ "$cpu_model" = "$INTEL_FAM6_ATOM_GOLDMONT" ] || \
-				[ "$cpu_model" = "$INTEL_FAM6_ATOM_GOLDMONT_X" ] || \
+				[ "$cpu_model" = "$INTEL_FAM6_ATOM_GOLDMONT_D" ] || \
 				[ "$cpu_model" = "$INTEL_FAM6_ATOM_GOLDMONT_PLUS" ] || \
+				[ "$cpu_model" = "$INTEL_FAM6_ATOM_TREMONT_D" ] || \
 				[ "$cpu_model" = "$INTEL_FAM6_XEON_PHI_KNL"     ] || \
 				[ "$cpu_model" = "$INTEL_FAM6_XEON_PHI_KNM" ]; then
 
-				_debug "is_cpu_vulnerable: intel family 6 but model known to be immune"
+				_debug "is_cpu_vulnerable: intel family 6 but model known to be immune to l1tf"
 				[ -z "$variantl1tf" ] && variantl1tf=immune
 			else
-				_debug "is_cpu_vulnerable: intel family 6 is vuln"
-				[ -z "$variantl1tf" ] && variantl1tf=vuln
+				_debug "is_cpu_vulnerable: intel family 6 is vuln to l1tf"
+				variantl1tf=vuln
 			fi
 		elif [ "$cpu_family" -lt 6 ]; then
-			_debug "is_cpu_vulnerable: intel family < 6 is immune"
+			_debug "is_cpu_vulnerable: intel family < 6 is immune to l1tf"
 			[ -z "$variantl1tf" ] && variantl1tf=immune
 		fi
 	elif is_amd || is_hygon; then
@@ -530,18 +546,54 @@ is_cpu_vulnerable()
 		done
 		variantl1tf=immune
 	fi
+
+	# we handle iTLB Multihit here (not linked to is_specex_free)
+	if is_intel; then
+		# commit f9aa6b73a407b714c9aac44734eb4045c893c6f7
+		if [ "$cpu_family" = 6 ]; then
+			if [ "$cpu_model" = "$INTEL_FAM6_ATOM_SALTWELL" ] || \
+				[ "$cpu_model" = "$INTEL_FAM6_ATOM_SALTWELL_TABLET" ] || \
+				[ "$cpu_model" = "$INTEL_FAM6_ATOM_SALTWELL_MID" ] || \
+				[ "$cpu_model" = "$INTEL_FAM6_ATOM_BONNELL" ] || \
+				[ "$cpu_model" = "$INTEL_FAM6_ATOM_BONNELL_MID" ] || \
+				[ "$cpu_model" = "$INTEL_FAM6_ATOM_SILVERMONT" ] || \
+				[ "$cpu_model" = "$INTEL_FAM6_ATOM_SILVERMONT_D" ] || \
+				[ "$cpu_model" = "$INTEL_FAM6_ATOM_SILVERMONT_MID" ] || \
+				[ "$cpu_model" = "$INTEL_FAM6_ATOM_AIRMONT" ] || \
+				[ "$cpu_model" = "$INTEL_FAM6_XEON_PHI_KNL" ] || \
+				[ "$cpu_model" = "$INTEL_FAM6_XEON_PHI_KNM" ] || \
+				[ "$cpu_model" = "$INTEL_FAM6_ATOM_AIRMONT_MID" ] || \
+				[ "$cpu_model" = "$INTEL_FAM6_ATOM_GOLDMONT" ] || \
+				[ "$cpu_model" = "$INTEL_FAM6_ATOM_GOLDMONT_D" ] || \
+				[ "$cpu_model" = "$INTEL_FAM6_ATOM_GOLDMONT_PLUS" ]; then
+				_debug "is_cpu_vulnerable: intel family 6 but model known to be immune to itlbmh"
+				[ -z "$variant_itlbmh" ] && variant_itlbmh=immune
+			else
+				_debug "is_cpu_vulnerable: intel family 6 is vuln to itlbmh"
+				variant_itlbmh=vuln
+			fi
+		elif [ "$cpu_family" -lt 6 ]; then
+			_debug "is_cpu_vulnerable: intel family < 6 is immune to itlbmh"
+			[ -z "$variant_itlbmh" ] && variant_itlbmh=immune
+		fi
+	else
+		_debug "is_cpu_vulnerable: non-intel not vulnerable to itlbmh"
+		[ -z "$variant_itlbmh" ] && variant_itlbmh=immune
+	fi
+
 	_debug "is_cpu_vulnerable: temp results are <$variant1> <$variant2> <$variant3> <$variant3a> <$variant4> <$variantl1tf>"
-	[ "$variant1"      = "immune" ] && variant1=1      || variant1=0
-	[ "$variant2"      = "immune" ] && variant2=1      || variant2=0
-	[ "$variant3"      = "immune" ] && variant3=1      || variant3=0
-	[ "$variant3a"     = "immune" ] && variant3a=1     || variant3a=0
-	[ "$variant4"      = "immune" ] && variant4=1      || variant4=0
-	[ "$variantl1tf"   = "immune" ] && variantl1tf=1   || variantl1tf=0
-	[ "$variant_msbds" = "immune" ] && variant_msbds=1 || variant_msbds=0
-	[ "$variant_mfbds" = "immune" ] && variant_mfbds=1 || variant_mfbds=0
-	[ "$variant_mlpds" = "immune" ] && variant_mlpds=1 || variant_mlpds=0
-	[ "$variant_mdsum" = "immune" ] && variant_mdsum=1 || variant_mdsum=0
-	[ "$variant_taa" = "immune" ] && variant_taa=1 || variant_taa=0
+	[ "$variant1"       = "immune" ] && variant1=1       || variant1=0
+	[ "$variant2"       = "immune" ] && variant2=1       || variant2=0
+	[ "$variant3"       = "immune" ] && variant3=1       || variant3=0
+	[ "$variant3a"      = "immune" ] && variant3a=1      || variant3a=0
+	[ "$variant4"       = "immune" ] && variant4=1       || variant4=0
+	[ "$variantl1tf"    = "immune" ] && variantl1tf=1    || variantl1tf=0
+	[ "$variant_msbds"  = "immune" ] && variant_msbds=1  || variant_msbds=0
+	[ "$variant_mfbds"  = "immune" ] && variant_mfbds=1  || variant_mfbds=0
+	[ "$variant_mlpds"  = "immune" ] && variant_mlpds=1  || variant_mlpds=0
+	[ "$variant_mdsum"  = "immune" ] && variant_mdsum=1  || variant_mdsum=0
+	[ "$variant_taa"    = "immune" ] && variant_taa=1    || variant_taa=0
+	[ "$variant_itlbmh" = "immune" ] && variant_itlbmh=1 || variant_itlbmh=0
 	variantl1tf_sgx="$variantl1tf"
 	# even if we are vulnerable to L1TF, if there's no SGX, we're safe for the original foreshadow
 	[ "$cpuid_sgx" = 0 ] && variantl1tf_sgx=1
@@ -606,7 +658,7 @@ is_cpu_mds_free()
 	if is_intel; then
 		if [ "$cpu_family" = 6 ]; then
 			if [ "$cpu_model" = "$INTEL_FAM6_ATOM_GOLDMONT" ] || \
-				[ "$cpu_model" = "$INTEL_FAM6_ATOM_GOLDMONT_X" ] || \
+				[ "$cpu_model" = "$INTEL_FAM6_ATOM_GOLDMONT_D" ] || \
 				[ "$cpu_model" = "$INTEL_FAM6_ATOM_GOLDMONT_PLUS" ]; then
 				return 0
 			fi
@@ -643,7 +695,7 @@ is_cpu_taa_free()
 	if ! is_intel; then
 		return 0
 	# is intel
-	elif [ "$capabilities_taa_no" = 0 ] || [ "$cpuid_rtm" = 0 ]; then
+	elif [ "$capabilities_taa_no" = 1 ] || [ "$cpuid_rtm" = 0 ]; then
 		return 0
 	fi
 
@@ -673,7 +725,7 @@ is_cpu_ssb_free()
 		if [ "$cpu_family" = 6 ]; then
 			if [ "$cpu_model" = "$INTEL_FAM6_ATOM_AIRMONT"          ] || \
 				[ "$cpu_model" = "$INTEL_FAM6_ATOM_SILVERMONT" ] || \
-				[ "$cpu_model" = "$INTEL_FAM6_ATOM_SILVERMONT_X" ] || \
+				[ "$cpu_model" = "$INTEL_FAM6_ATOM_SILVERMONT_D" ] || \
 				[ "$cpu_model" = "$INTEL_FAM6_ATOM_SILVERMONT_MID"  ]; then
 				return 0
 			elif [ "$cpu_model" = "$INTEL_FAM6_CORE_YONAH"          ] || \
@@ -706,16 +758,15 @@ show_header()
 
 [ -z "$HOME" ] && HOME="$(getent passwd "$(whoami)" | cut -d: -f6)"
 mcedb_cache="$HOME/.mcedb"
-update_mcedb()
+update_fwdb()
 {
-	# We're using MCE.db from the excellent platomav's MCExtractor project
 	show_header
 
 	if [ -r "$mcedb_cache" ]; then
-		previous_mcedb_revision=$(awk '/^# %%% MCEDB / { print $4 }' "$mcedb_cache")
+		previous_dbversion=$(awk '/^# %%% MCEDB / { print $4 }' "$mcedb_cache")
 	fi
 
-	# first download the database
+	# first, download the MCE.db from the excellent platomav's MCExtractor project
 	mcedb_tmp="$(mktemp /tmp/mcedb-XXXXXX)"
 	mcedb_url='https://github.com/platomav/MCExtractor/raw/master/MCE.db'
 	_info_nol "Fetching MCE.db from the MCExtractor project... "
@@ -735,8 +786,29 @@ update_mcedb()
 	fi
 	echo DONE
 
-	# now extract contents using sqlite
-	_info_nol "Extracting data... "
+	# second, get the Intel firmwares from GitHub
+	intel_tmp="$(mktemp -d /tmp/intelfw-XXXXXX)"
+	intel_url="https://github.com/intel/Intel-Linux-Processor-Microcode-Data-Files/archive/master.zip"
+	_info_nol "Fetching Intel firmwares... "
+	## https://github.com/intel/Intel-Linux-Processor-Microcode-Data-Files.git
+	if command -v wget >/dev/null 2>&1; then
+		wget -q "$intel_url" -O "$intel_tmp/fw.zip"; ret=$?
+	elif command -v curl >/dev/null 2>&1; then
+		curl -sL "$intel_url" -o "$intel_tmp/fw.zip"; ret=$?
+	elif command -v fetch >/dev/null 2>&1; then
+		fetch -q "$intel_url" -o "$intel_tmp/fw.zip"; ret=$?
+	else
+		echo ERROR "please install one of \`wget\`, \`curl\` of \`fetch\` programs"
+		return 1
+	fi
+	if [ "$ret" != 0 ]; then
+		echo ERROR "error $ret while downloading Intel firmwares"
+		return $ret
+	fi
+	echo DONE
+
+	# now extract MCEdb contents using sqlite
+	_info_nol "Extracting MCEdb data... "
 	if ! command -v sqlite3 >/dev/null 2>&1; then
 		echo ERROR "please install the \`sqlite3\` program"
 		return 1
@@ -747,17 +819,68 @@ update_mcedb()
 		echo ERROR "downloaded file seems invalid"
 		return 1
 	fi
+
 	echo OK "MCExtractor database revision $mcedb_revision dated $mcedb_date"
-	if [ -n "$previous_mcedb_revision" ]; then
-		if [ "$previous_mcedb_revision" = "v$mcedb_revision" ]; then
-			echo "We already have this version locally, no update needed"
-			[ "$1" != builtin ] && return 0
-		fi
+
+	# parse Intel firmwares to get their versions
+	_info_nol "Integrating Intel firmwares data to db... "
+	if ! command -v unzip >/dev/null 2>&1; then
+		echo ERROR "please install the \`unzip\` program"
+		return 1
 	fi
-	echo "# Spectre & Meltdown Checker" > "$mcedb_cache"
-	echo "# %%% MCEDB v$mcedb_revision - $mcedb_date" >> "$mcedb_cache"
-	sqlite3 "$mcedb_tmp" "select '# I,0x'||cpuid||',0x'||version||','||max(yyyymmdd) from Intel group by cpuid order by cpuid asc; select '# A,0x'||cpuid||',0x'||version||','||max(yyyymmdd) from AMD group by cpuid order by cpuid asc" | grep -v '^# .,0x00000000,' >> "$mcedb_cache"
-	echo OK "local version updated"
+	( cd "$intel_tmp" && unzip fw.zip >/dev/null; )
+	if ! [ -d "$intel_tmp/Intel-Linux-Processor-Microcode-Data-Files-master/intel-ucode" ]; then
+		echo ERROR "expected the 'intel-ucode' folder in the downloaded zip file"
+		return 1
+	fi
+
+	if ! command -v iucode_tool >/dev/null 2>&1; then
+		if ! command -v iucode-tool >/dev/null 2>&1; then
+			echo ERROR "please install the \`iucode-tool\` program"
+			return 1
+		else
+			iucode_tool="iucode-tool"
+		fi
+	else
+		iucode_tool="iucode_tool"
+	fi
+	#  079/001: sig 0x000106c2, pf_mask 0x01, 2009-04-10, rev 0x0217, size 5120
+	#  078/004: sig 0x000106ca, pf_mask 0x10, 2009-08-25, rev 0x0107, size 5120
+	$iucode_tool -l "$intel_tmp/Intel-Linux-Processor-Microcode-Data-Files-master/intel-ucode" | grep -wF sig | while read -r _line
+	do
+		_line=$(   echo "$_line" | tr -d ',')
+		_cpuid=$(  echo "$_line" | awk '{print $3}')
+		_cpuid=$(( _cpuid ))
+		_cpuid=$(printf "0x%08X" "$_cpuid")
+		_date=$(   echo "$_line" | awk '{print $6}' | tr -d '-')
+		_version=$(echo "$_line" | awk '{print $8}')
+		_version=$(( _version ))
+		_version=$(printf "0x%08X" "$_version")
+		_sqlstm="$(printf "INSERT INTO Intel (cpuid,version,yyyymmdd) VALUES (\"%s\",\"%s\",\"%s\");" "$(printf "%08X" "$_cpuid")" "$(printf "%08X" "$_version")" "$_date")"
+		sqlite3 "$mcedb_tmp" "$_sqlstm"
+	done
+	_intel_latest_date=$(sqlite3 "$mcedb_tmp" "SELECT yyyymmdd from Intel ORDER BY yyyymmdd DESC LIMIT 1;")
+	echo DONE "(version $_intel_latest_date)"
+
+	dbdate=$(echo "$mcedb_date" | tr -d '/')
+	if [ "$dbdate" -lt "$_intel_latest_date" ]; then
+		dbdate="$_intel_latest_date"
+	fi
+	dbversion="$mcedb_revision.$dbdate+i$_intel_latest_date"
+
+	if [ "$1" != builtin ] && [ -n "$previous_dbversion" ] && [ "$previous_dbversion" = "v$dbversion" ]; then
+		echo "We already have this version locally, no update needed"
+		return 0
+	fi
+
+	_info_nol "Building local database... "
+	{
+		echo "# Spectre & Meltdown Checker";
+		echo "# %%% MCEDB v$dbversion";
+		sqlite3 "$mcedb_tmp" "SELECT '# I,0x'||t1.cpuid||',0x'||MAX(t1.version)||','||t1.yyyymmdd FROM Intel AS t1 LEFT OUTER JOIN Intel AS t2 ON t2.cpuid=t1.cpuid AND t2.yyyymmdd > t1.yyyymmdd WHERE t2.yyyymmdd IS NULL GROUP BY t1.cpuid ORDER BY t1.cpuid ASC;" | grep -v '^# .,0x00000000,';
+		sqlite3 "$mcedb_tmp" "SELECT '# A,0x'||t1.cpuid||',0x'||MAX(t1.version)||','||t1.yyyymmdd FROM AMD   AS t1 LEFT OUTER JOIN AMD   AS t2 ON t2.cpuid=t1.cpuid AND t2.yyyymmdd > t1.yyyymmdd WHERE t2.yyyymmdd IS NULL GROUP BY t1.cpuid ORDER BY t1.cpuid ASC;" | grep -v '^# .,0x00000000,';
+	} > "$mcedb_cache"
+	echo DONE "(version $dbversion)"
 
 	if [ "$1" = builtin ]; then
 		newfile=$(mktemp /tmp/smc-XXXXXX)
@@ -843,11 +966,11 @@ while [ -n "$1" ]; do
 		# deprecated, kept for compatibility
 		opt_explain=0
 		shift
-	elif [ "$1" = "--update-mcedb" ]; then
-		update_mcedb
+	elif [ "$1" = "--update-fwdb" ] || [ "$1" = "--update-mcedb" ]; then
+		update_fwdb
 		exit $?
-	elif [ "$1" = "--update-builtin-mcedb" ]; then
-		update_mcedb builtin
+	elif [ "$1" = "--update-builtin-fwdb" ] || [ "$1" = "--update-builtin-mcedb" ]; then
+		update_fwdb builtin
 		exit $?
 	elif [ "$1" = "--dump-mock-data" ]; then
 		opt_mock=1
@@ -917,8 +1040,9 @@ while [ -n "$1" ]; do
 			mdsum)  opt_cve_list="$opt_cve_list CVE-2019-11091"; opt_cve_all=0;;
 			l1tf)	opt_cve_list="$opt_cve_list CVE-2018-3615 CVE-2018-3620 CVE-2018-3646"; opt_cve_all=0;;
 			taa)	opt_cve_list="$opt_cve_list CVE-2019-11135"; opt_cve_all=0;;
+			mcepsc)	opt_cve_list="$opt_cve_list CVE-2018-12207"; opt_cve_all=0;;
 			*)
-				echo "$0: error: invalid parameter '$2' for --variant, expected either 1, 2, 3, 3a, 4, msbds, mfbds, mlpds, mdsum, taa or l1tf" >&2;
+				echo "$0: error: invalid parameter '$2' for --variant, expected either 1, 2, 3, 3a, 4, l1tf, msbds, mfbds, mlpds, mdsum, taa or mcepsc" >&2;
 				exit 255
 				;;
 		esac
@@ -1004,6 +1128,7 @@ pvulnstatus()
 			CVE-2018-12127) aka="MLPDS";;
 			CVE-2019-11091) aka="MDSUM";;
 			CVE-2019-11135) aka="TAA";;
+			CVE-2018-12207) aka="ITLBMH";;
 			*) echo "$0: error: invalid CVE '$1' passed to pvulnstatus()" >&2; exit 255;;
 		esac
 
@@ -1017,7 +1142,8 @@ pvulnstatus()
 					OK)   is_vuln="false";;
 					*)    echo "$0: error: unknown status '$2' passed to pvulnstatus()" >&2; exit 255;;
 				esac
-				json_output="${json_output:-[}{\"NAME\":\"$aka\",\"CVE\":\"$1\",\"VULNERABLE\":$is_vuln,\"INFOS\":\"$3\"},"
+				[ -z "$json_output" ] && json_output='['
+				json_output="${json_output}{\"NAME\":\"$aka\",\"CVE\":\"$1\",\"VULNERABLE\":$is_vuln,\"INFOS\":\"$3\"},"
 				;;
 
 			nrpe)	[ "$2" = VULN ] && nrpe_vuln="$nrpe_vuln $1";;
@@ -1070,14 +1196,14 @@ kernel_err=''
 check_kernel()
 {
 	_file="$1"
-	_desperate_mode="$2"
+	_mode="$2"
 	# checking the return code of readelf -h is not enough, we could get
 	# a damaged ELF file and validate it, check for stderr warnings too
 	_readelf_warnings=$("${opt_arch_prefix}readelf" -S "$_file" 2>&1 >/dev/null | tr "\n" "/"); ret=$?
 	_readelf_sections=$("${opt_arch_prefix}readelf" -S "$_file" 2>/dev/null | grep -c -e data -e text -e init)
 	_kernel_size=$(stat -c %s "$_file" 2>/dev/null || stat -f %z "$_file" 2>/dev/null || echo 10000)
 	_debug "check_kernel: ret=$? size=$_kernel_size sections=$_readelf_sections warnings=$_readelf_warnings"
-	if [ -n "$_desperate_mode" ]; then
+	if [ "$_mode" = desperate ]; then
 		if "${opt_arch_prefix}strings" "$_file" | grep -Eq '^Linux version '; then
 			_debug "check_kernel (desperate): ... matched!"
 			return 0
@@ -1110,8 +1236,17 @@ try_decompress()
 	do
 		_debug "try_decompress: magic for $3 found at offset $pos"
 		if ! command -v "$3" >/dev/null 2>&1; then
-			kernel_err="missing '$3' tool, please install it, usually it's in the '$5' package"
-			return 0
+			if [ "$8" = 1 ]; then
+				# pass1: if the tool is not installed, just bail out silently
+				# and hope that the next decompression tool will be, and that
+				# it'll happen to be the proper one for this kernel
+				_debug "try_decompress: the '$3' tool is not installed (pass 1), try the next algo"
+			else
+				# pass2: if the tool is not installed, populate kernel_err this time
+				kernel_err="missing '$3' tool, please install it, usually it's in the '$5' package"
+				_debug "try_decompress: $kernel_err"
+			fi
+			return 1
 		fi
 		pos=${pos%%:*}
 		# shellcheck disable=SC2086
@@ -1144,22 +1279,27 @@ extract_kernel()
 
 	# Initial attempt for uncompressed images or objects:
 	if check_kernel "$1"; then
+		_debug "extract_kernel: found kernel is valid, no decompression needed"
 		cat "$1" > "$kerneltmp"
 		kernel=$kerneltmp
 		return 0
 	fi
 
 	# That didn't work, so retry after decompression.
-	for mode in '' 'desperate'; do
-		try_decompress '\037\213\010'     xy    gunzip  ''      gunzip      "$1" "$mode" && return 0
-		try_decompress '\3757zXZ\000'     abcde unxz    ''      xz-utils    "$1" "$mode" && return 0
-		try_decompress 'BZh'              xy    bunzip2 ''      bzip2       "$1" "$mode" && return 0
-		try_decompress '\135\0\0\0'       xxx   unlzma  ''      xz-utils    "$1" "$mode" && return 0
-		try_decompress '\211\114\132'     xy    'lzop'  '-d'    lzop        "$1" "$mode" && return 0
-		try_decompress '\002\041\114\030' xyy   'lz4'   '-d -l' liblz4-tool "$1" "$mode" && return 0
-		try_decompress '\177ELF'          xxy   'cat'   ''      cat         "$1" "$mode" && return 0
+	for pass in 1 2; do
+		for mode in normal desperate; do
+			_debug "extract_kernel: pass $pass $mode mode"
+			try_decompress '\037\213\010'     xy    gunzip  ''      gunzip      "$1" "$mode" "$pass" && return 0
+			try_decompress '\002\041\114\030' xyy   'lz4'   '-d -l' liblz4-tool "$1" "$mode" "$pass" && return 0
+			try_decompress '\3757zXZ\000'     abcde unxz    ''      xz-utils    "$1" "$mode" "$pass" && return 0
+			try_decompress 'BZh'              xy    bunzip2 ''      bzip2       "$1" "$mode" "$pass" && return 0
+			try_decompress '\135\0\0\0'       xxx   unlzma  ''      xz-utils    "$1" "$mode" "$pass" && return 0
+			try_decompress '\211\114\132'     xy    'lzop'  '-d'    lzop        "$1" "$mode" "$pass" && return 0
+			try_decompress '\177ELF'          xxy   'cat'   ''      cat         "$1" "$mode" "$pass" && return 0
+		done
 	done
-	_verbose "Couldn't extract the kernel image, accuracy might be reduced"
+	kernel_err="kernel compression format is unknown or image is invalid"
+	_verbose "Couldn't extract the kernel image ($kernel_err), accuracy might be reduced"
 	return 1
 }
 
@@ -1425,66 +1565,68 @@ parse_cpu_details()
 	ucode_found=$(printf "model 0x%x family 0x%x stepping 0x%x ucode 0x%x cpuid 0x%x" "$cpu_model" "$cpu_family" "$cpu_stepping" "$cpu_ucode" "$cpu_cpuid")
 
 	# also define those that we will need in other funcs
-	# taken from ttps://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/arch/x86/include/asm/intel-family.h
+	# taken from https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/arch/x86/include/asm/intel-family.h
+	# curl -s 'https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/plain/arch/x86/include/asm/intel-family.h' | awk '/#define INTEL_FAM6/ {print $2"=$(( "$3" )) # "$4,$5,$6,$7,$8,$9}'
 	# shellcheck disable=SC2034
 	{
+	INTEL_FAM6_CORE_YONAH=$(( 0x0E )) #
+	INTEL_FAM6_CORE2_MEROM=$(( 0x0F )) #
+	INTEL_FAM6_CORE2_MEROM_L=$(( 0x16 )) #
+	INTEL_FAM6_CORE2_PENRYN=$(( 0x17 )) #
+	INTEL_FAM6_CORE2_DUNNINGTON=$(( 0x1D )) #
+	INTEL_FAM6_NEHALEM=$(( 0x1E )) #
+	INTEL_FAM6_NEHALEM_G=$(( 0x1F )) # /* Auburndale / Havendale */
+	INTEL_FAM6_NEHALEM_EP=$(( 0x1A )) #
+	INTEL_FAM6_NEHALEM_EX=$(( 0x2E )) #
+	INTEL_FAM6_WESTMERE=$(( 0x25 )) #
+	INTEL_FAM6_WESTMERE_EP=$(( 0x2C )) #
+	INTEL_FAM6_WESTMERE_EX=$(( 0x2F )) #
+	INTEL_FAM6_SANDYBRIDGE=$(( 0x2A )) #
+	INTEL_FAM6_SANDYBRIDGE_X=$(( 0x2D )) #
+	INTEL_FAM6_IVYBRIDGE=$(( 0x3A )) #
+	INTEL_FAM6_IVYBRIDGE_X=$(( 0x3E )) #
+	INTEL_FAM6_HASWELL=$(( 0x3C )) #
+	INTEL_FAM6_HASWELL_X=$(( 0x3F )) #
+	INTEL_FAM6_HASWELL_L=$(( 0x45 )) #
+	INTEL_FAM6_HASWELL_G=$(( 0x46 )) #
+	INTEL_FAM6_BROADWELL=$(( 0x3D )) #
+	INTEL_FAM6_BROADWELL_G=$(( 0x47 )) #
+	INTEL_FAM6_BROADWELL_X=$(( 0x4F )) #
+	INTEL_FAM6_BROADWELL_D=$(( 0x56 )) #
+	INTEL_FAM6_SKYLAKE_L=$(( 0x4E )) #
+	INTEL_FAM6_SKYLAKE=$(( 0x5E )) #
+	INTEL_FAM6_SKYLAKE_X=$(( 0x55 )) #
+	INTEL_FAM6_KABYLAKE_L=$(( 0x8E )) #
+	INTEL_FAM6_KABYLAKE=$(( 0x9E )) #
+	INTEL_FAM6_CANNONLAKE_L=$(( 0x66 )) #
+	INTEL_FAM6_ICELAKE_X=$(( 0x6A )) #
+	INTEL_FAM6_ICELAKE_D=$(( 0x6C )) #
+	INTEL_FAM6_ICELAKE=$(( 0x7D )) #
+	INTEL_FAM6_ICELAKE_L=$(( 0x7E )) #
+	INTEL_FAM6_ICELAKE_NNPI=$(( 0x9D )) #
+	INTEL_FAM6_TIGERLAKE_L=$(( 0x8C )) #
+	INTEL_FAM6_TIGERLAKE=$(( 0x8D )) #
+	INTEL_FAM6_COMETLAKE=$(( 0xA5 )) #
+	INTEL_FAM6_COMETLAKE_L=$(( 0xA6 )) #
+	INTEL_FAM6_ATOM_BONNELL=$(( 0x1C )) # /* Diamondville, Pineview */
+	INTEL_FAM6_ATOM_BONNELL_MID=$(( 0x26 )) # /* Silverthorne, Lincroft */
+	INTEL_FAM6_ATOM_SALTWELL=$(( 0x36 )) # /* Cedarview */
+	INTEL_FAM6_ATOM_SALTWELL_MID=$(( 0x27 )) # /* Penwell */
+	INTEL_FAM6_ATOM_SALTWELL_TABLET=$(( 0x35 )) # /* Cloverview */
+	INTEL_FAM6_ATOM_SILVERMONT=$(( 0x37 )) # /* Bay Trail, Valleyview */
+	INTEL_FAM6_ATOM_SILVERMONT_D=$(( 0x4D )) # /* Avaton, Rangely */
+	INTEL_FAM6_ATOM_SILVERMONT_MID=$(( 0x4A )) # /* Merriefield */
+	INTEL_FAM6_ATOM_AIRMONT=$(( 0x4C )) # /* Cherry Trail, Braswell */
+	INTEL_FAM6_ATOM_AIRMONT_MID=$(( 0x5A )) # /* Moorefield */
+	INTEL_FAM6_ATOM_AIRMONT_NP=$(( 0x75 )) # /* Lightning Mountain */
+	INTEL_FAM6_ATOM_GOLDMONT=$(( 0x5C )) # /* Apollo Lake */
+	INTEL_FAM6_ATOM_GOLDMONT_D=$(( 0x5F )) # /* Denverton */
+	INTEL_FAM6_ATOM_GOLDMONT_PLUS=$(( 0x7A )) # /* Gemini Lake */
+	INTEL_FAM6_ATOM_TREMONT_D=$(( 0x86 )) # /* Jacobsville */
+	INTEL_FAM6_ATOM_TREMONT=$(( 0x96 )) # /* Elkhart Lake */
+	INTEL_FAM6_XEON_PHI_KNL=$(( 0x57 )) # /* Knights Landing */
+	INTEL_FAM6_XEON_PHI_KNM=$(( 0x85 )) # /* Knights Mill */
 	INTEL_FAM6_CORE_YONAH=$(( 0x0E ))
-
-	INTEL_FAM6_CORE2_MEROM=$(( 0x0F ))
-	INTEL_FAM6_CORE2_MEROM_L=$(( 0x16 ))
-	INTEL_FAM6_CORE2_PENRYN=$(( 0x17 ))
-	INTEL_FAM6_CORE2_DUNNINGTON=$(( 0x1D ))
-
-	INTEL_FAM6_NEHALEM=$(( 0x1E ))
-	INTEL_FAM6_NEHALEM_G=$(( 0x1F ))
-	INTEL_FAM6_NEHALEM_EP=$(( 0x1A ))
-	INTEL_FAM6_NEHALEM_EX=$(( 0x2E ))
-
-	INTEL_FAM6_WESTMERE=$(( 0x25 ))
-	INTEL_FAM6_WESTMERE_EP=$(( 0x2C ))
-	INTEL_FAM6_WESTMERE_EX=$(( 0x2F ))
-
-	INTEL_FAM6_SANDYBRIDGE=$(( 0x2A ))
-	INTEL_FAM6_SANDYBRIDGE_X=$(( 0x2D ))
-	INTEL_FAM6_IVYBRIDGE=$(( 0x3A ))
-	INTEL_FAM6_IVYBRIDGE_X=$(( 0x3E ))
-
-	INTEL_FAM6_HASWELL_CORE=$(( 0x3C ))
-	INTEL_FAM6_HASWELL_X=$(( 0x3F ))
-	INTEL_FAM6_HASWELL_ULT=$(( 0x45 ))
-	INTEL_FAM6_HASWELL_GT3E=$(( 0x46 ))
-
-	INTEL_FAM6_BROADWELL_CORE=$(( 0x3D ))
-	INTEL_FAM6_BROADWELL_GT3E=$(( 0x47 ))
-	INTEL_FAM6_BROADWELL_X=$(( 0x4F ))
-	INTEL_FAM6_BROADWELL_XEON_D=$(( 0x56 ))
-
-	INTEL_FAM6_SKYLAKE_MOBILE=$(( 0x4E ))
-	INTEL_FAM6_SKYLAKE_DESKTOP=$(( 0x5E ))
-	INTEL_FAM6_SKYLAKE_X=$(( 0x55 ))
-	INTEL_FAM6_KABYLAKE_MOBILE=$(( 0x8E ))
-	INTEL_FAM6_KABYLAKE_DESKTOP=$(( 0x9E ))
-
-	# /* "Small Core" Processors (Atom) */
-
-	INTEL_FAM6_ATOM_BONNELL=$(( 0x1C ))
-	INTEL_FAM6_ATOM_BONNELL_MID=$(( 0x26 ))
-	INTEL_FAM6_ATOM_SALTWELL_MID=$(( 0x27 ))
-	INTEL_FAM6_ATOM_SALTWELL_TABLET=$(( 0x35 ))
-	INTEL_FAM6_ATOM_SALTWELL=$(( 0x36 ))
-	INTEL_FAM6_ATOM_SILVERMONT=$(( 0x37 ))
-	INTEL_FAM6_ATOM_SILVERMONT_MID=$(( 0x4A ))
-	INTEL_FAM6_ATOM_SILVERMONT_X=$(( 0x4D ))
-	INTEL_FAM6_ATOM_AIRMONT=$(( 0x4C ))
-	INTEL_FAM6_ATOM_AIRMONT_MID=$(( 0x5A ))
-	INTEL_FAM6_ATOM_GOLDMONT=$(( 0x5C ))
-	INTEL_FAM6_ATOM_GOLDMONT_X=$(( 0x5F ))
-	INTEL_FAM6_ATOM_GOLDMONT_PLUS=$(( 0x7A ))
-
-	# /* Xeon Phi */
-
-	INTEL_FAM6_XEON_PHI_KNL=$(( 0x57 ))
-	INTEL_FAM6_XEON_PHI_KNM=$(( 0x85 ))
 	}
 	parse_cpu_details_done=1
 }
@@ -1551,7 +1693,7 @@ is_ucode_blacklisted()
 		$INTEL_FAM6_BROADWELL_XEON_D,0x03,0x07000011 \
 		$INTEL_FAM6_BROADWELL_X,0x01,0x0b000023 \
 		$INTEL_FAM6_BROADWELL_X,0x01,0x0b000025 \
-		$INTEL_FAM6_HASWELL_ULT,0x01,0x21      \
+		$INTEL_FAM6_HASWELL_L,0x01,0x21        \
 		$INTEL_FAM6_HASWELL_GT3E,0x01,0x18     \
 		$INTEL_FAM6_HASWELL_CORE,0x03,0x23     \
 		$INTEL_FAM6_HASWELL_X,0x02,0x3b        \
@@ -1560,10 +1702,10 @@ is_ucode_blacklisted()
 		$INTEL_FAM6_SANDYBRIDGE_X,0x06,0x61b   \
 		$INTEL_FAM6_SANDYBRIDGE_X,0x07,0x712
 	do
-		model=$(echo $tuple | cut -d, -f1)
-		stepping=$(( $(echo $tuple | cut -d, -f2) ))
+		model=$(echo "$tuple" | cut -d, -f1)
+		stepping=$(( $(echo "$tuple" | cut -d, -f2) ))
 		if [ "$cpu_model" = "$model" ] && [ "$cpu_stepping" = "$stepping" ]; then
-			ucode=$(( $(echo $tuple | cut -d, -f3) ))
+			ucode=$(( $(echo "$tuple" | cut -d, -f3) ))
 			if [ "$cpu_ucode" = "$ucode" ]; then
 				_debug "is_ucode_blacklisted: we have a match! ($cpu_model/$cpu_stepping/$cpu_ucode)"
 				return 0
@@ -1590,11 +1732,11 @@ is_skylake_cpu()
 	parse_cpu_details
 	is_intel || return 1
 	[ "$cpu_family" = 6 ] || return 1
-	if [ "$cpu_model" = $INTEL_FAM6_SKYLAKE_MOBILE        ] || \
-		[ "$cpu_model" = $INTEL_FAM6_SKYLAKE_DESKTOP  ] || \
-		[ "$cpu_model" = $INTEL_FAM6_SKYLAKE_X        ] || \
-		[ "$cpu_model" = $INTEL_FAM6_KABYLAKE_MOBILE  ] || \
-		[ "$cpu_model" = $INTEL_FAM6_KABYLAKE_DESKTOP ]; then
+	if [ "$cpu_model" = $INTEL_FAM6_SKYLAKE_L       ] || \
+		[ "$cpu_model" = $INTEL_FAM6_SKYLAKE    ] || \
+		[ "$cpu_model" = $INTEL_FAM6_SKYLAKE_X  ] || \
+		[ "$cpu_model" = $INTEL_FAM6_KABYLAKE_L ] || \
+		[ "$cpu_model" = $INTEL_FAM6_KABYLAKE   ]; then
 		return 0
 	fi
 	return 1
@@ -1677,12 +1819,21 @@ is_xen_domU()
 	fi
 }
 
+builtin_dbversion=$(awk '/^# %%% MCEDB / { print $4 }' "$0")
 if [ -r "$mcedb_cache" ]; then
-	mcedb_source="$mcedb_cache"
-	mcedb_info="local MCExtractor DB "$(grep -E '^# %%% MCEDB ' "$mcedb_source" | cut -c13-)
-else
+	# we have a local cache file, but it might be older than the builtin version we have
+	local_dbversion=$(  awk '/^# %%% MCEDB / { print $4 }' "$mcedb_cache")
+	# sort -V sorts by version number
+	older_dbversion=$(printf "%b\n%b" "$local_dbversion" "$builtin_dbversion" | sort -V | head -n1)
+	if [ "$older_dbversion" = "$builtin_dbversion" ]; then
+		mcedb_source="$mcedb_cache"
+		mcedb_info="local firmwares DB $local_dbversion"
+	fi
+fi
+# if mcedb_source is not set, either we don't have a local cached db, or it is older than the builtin db
+if [ -z "$mcedb_source" ]; then
 	mcedb_source="$0"
-	mcedb_info="builtin MCExtractor DB "$(grep -E '^# %%% MCEDB ' "$mcedb_source" | cut -c13-)
+	mcedb_info="builtin firmwares DB $builtin_dbversion"
 fi
 read_mcedb()
 {
@@ -2041,7 +2192,7 @@ sys_interface_check()
 		# Not affected
 		status=OK
 		pstatus green YES "$fullmsg"
-	elif echo "$msg" | grep -qi '^mitigation'; then
+	elif echo "$msg" | grep -qEi '^(kvm: )?mitigation'; then
 		# Mitigation: PTI
 		status=OK
 		pstatus green YES "$fullmsg"
@@ -2085,6 +2236,7 @@ write_msr()
 	if [ -n "$(eval echo \$$_mockvarname)" ]; then
 		_debug "write_msr: MOCKING enabled for msr $_msr func returns $(eval echo \$$_mockvarname)"
 		mocked=1
+		[ "$(eval echo \$$_mockvarname)" = 202 ] && msr_locked_down=1
 		return "$(eval echo \$$_mockvarname)"
 	fi
 
@@ -2112,6 +2264,27 @@ write_msr()
 			_debug "write_msr: got no wrmsr, perl or recent enough dd!"
 			mockme=$(printf "%b\n%b" "$mockme" "SMC_MOCK_WRMSR_${_msr}_RET=201")
 			return 201 # missing tool error
+		fi
+		if [ "$ret" != 0 ]; then
+			# * Fedora (and probably Red Hat) have a "kernel lock down" feature that prevents us to write to MSRs
+			# when this mode is enabled and EFI secure boot is enabled (see issue #303)
+			# https://src.fedoraproject.org/rpms/kernel/blob/master/f/efi-lockdown.patch
+			# when this happens, any write will fail and dmesg will have a msg printed "msr: Direct access to MSR"
+			# * A version of this patch also made it to vanilla in 5.4+, in that case the message is: 'raw MSR access is restricted'
+			# * we don't use dmesg_grep() because we don't care if dmesg is truncated here, as the message has just been printed
+			if dmesg | grep -qF "msr: Direct access to MSR"; then
+				_debug "write_msr: locked down kernel detected (Red Hat / Fedora)"
+				mockme=$(printf "%b\n%b" "$mockme" "SMC_MOCK_WRMSR_${_msr}_RET=202")
+				msr_locked_down=1
+				msr_locked_down_msg="your kernel is locked down (Fedora/Red Hat), please reboot without secure boot and retry"
+				return 202 # lockdown error
+			elif dmesg | grep -qF "raw MSR access is restricted"; then
+				_debug "write_msr: locked down kernel detected (vanilla)"
+				mockme=$(printf "%b\n%b" "$mockme" "SMC_MOCK_WRMSR_${_msr}_RET=202")
+				msr_locked_down=1
+				msr_locked_down_msg="your kernel is locked down, please reboot with lockdown=none in the kernel cmdline and retry"
+				return 202 # lockdown error
+			fi
 		fi
 	fi
 	# normalize ret
@@ -2168,15 +2341,15 @@ read_msr()
 			return 200 # permission error
 		# if rdmsr is available, use it
 		elif command -v rdmsr >/dev/null 2>&1 && [ "$SMC_NO_RDMSR" != 1 ]; then
-			_debug "read_msr: using rdmsr"
+			_debug "read_msr: using rdmsr on $_msr"
 			read_msr_value=$(rdmsr -r $_msr_dec 2>/dev/null | od -t u8 -A n)
 		# or if we have perl, use it, any 5.x version will work
 		elif command -v perl >/dev/null 2>&1 && [ "$SMC_NO_PERL" != 1 ]; then
-			_debug "read_msr: using perl"
+			_debug "read_msr: using perl on $_msr"
 			read_msr_value=$(perl -e "open(M,'<','/dev/cpu/$_cpu/msr') and seek(M,$_msr_dec,0) and read(M,\$_,8) and print" | od -t u8 -A n)
 		# fallback to dd if it supports skip_bytes
 		elif dd if=/dev/null of=/dev/null bs=8 count=1 skip="$_msr_dec" iflag=skip_bytes 2>/dev/null; then
-			_debug "read_msr: using dd"
+			_debug "read_msr: using dd on $_msr"
 			read_msr_value=$(dd if=/dev/cpu/"$_cpu"/msr bs=8 count=1 skip="$_msr_dec" iflag=skip_bytes 2>/dev/null | od -t u8 -A n)
 		else
 			_debug "read_msr: got no rdmsr, perl or recent enough dd!"
@@ -2248,6 +2421,9 @@ check_cpu()
 			spec_ctrl_msr=-1
 		elif [ $val -eq 201 ]; then
 			pstatus yellow UNKNOWN "missing tool, install either msr-tools or perl"
+			spec_ctrl_msr=-1
+		elif [ $val -eq 202 ]; then
+			pstatus yellow UNKNOWN "$msr_locked_down_msg"
 			spec_ctrl_msr=-1
 		else
 			spec_ctrl_msr=0
@@ -2337,6 +2513,10 @@ check_cpu()
 			fi
 		elif [ $val -eq 200 ]; then
 			pstatus yellow UNKNOWN "is msr kernel module available?"
+		elif [ $val -eq 201 ]; then
+			pstatus yellow UNKNOWN "missing tool, install either msr-tools or perl"
+		elif [ $val -eq 202 ]; then
+			pstatus yellow UNKNOWN "$msr_locked_down_msg"
 		else
 			pstatus yellow NO
 		fi
@@ -2515,6 +2695,10 @@ check_cpu()
 			fi
 		elif [ $val -eq 200 ]; then
 			pstatus yellow UNKNOWN "is msr kernel module available?"
+		elif [ $val -eq 201 ]; then
+			pstatus yellow UNKNOWN "missing tool, install either msr-tools or perl"
+		elif [ $val -eq 202 ]; then
+			pstatus yellow UNKNOWN "$msr_locked_down_msg"
 		else
 			pstatus yellow NO
 		fi
@@ -2524,6 +2708,7 @@ check_cpu()
 	read_cpuid 0x7 $EDX 28 1 1; ret=$?
 	if [ $ret -eq 0 ]; then
 		pstatus green YES "L1D flush feature bit"
+		cpuid_l1df=1
 	elif [ $ret -eq 1 ]; then
 		pstatus yellow NO
 	elif [ $ret -eq 2 ]; then
@@ -2542,22 +2727,6 @@ check_cpu()
 			pstatus yellow UNKNOWN "is cpuid kernel module available?"
 		else
 			cpuid_md_clear=0
-			pstatus yellow NO
-		fi
-	fi
-
-	if is_intel; then
-		_info "  * TSX Asynchronous Abort"
-		_info_nol "    * TSX support is available: "
-		read_cpuid 0x7 $EDX 11 1 1; ret=$?
-		if [ $ret -eq 0 ]; then
-			cpuid_rtm=1
-			pstatus green YES "TSX RTM feature bit"
-		elif [ $ret -eq 2 ]; then
-			cpuid_rtm=-1
-			pstatus yellow UNKNOWN "is cpuid kernel module available?"
-		else
-			cpuid_rtm=0
 			pstatus yellow NO
 		fi
 	fi
@@ -2586,6 +2755,8 @@ check_cpu()
 		capabilities_rsba=-1
 		capabilities_l1dflush_no=-1
 		capabilities_ssb_no=-1
+		capabilities_pschange_msc_no=-1
+		capabilities_tsx_ctrl_msr=-1
 		if [ "$cpuid_arch_capabilities" = -1 ]; then
 			pstatus yellow UNKNOWN
 		elif [ "$cpuid_arch_capabilities" != 1 ]; then
@@ -2596,6 +2767,8 @@ check_cpu()
 			capabilities_rsba=0
 			capabilities_l1dflush_no=0
 			capabilities_ssb_no=0
+			capabilities_pschange_msc_no=0
+			capabilities_tsx_ctrl_msr=0
 			pstatus yellow NO
 		elif [ ! -e /dev/cpu/0/msr ] && [ ! -e /dev/cpuctl0 ]; then
 			spec_ctrl_msr=-1
@@ -2629,7 +2802,10 @@ check_cpu()
 			capabilities_rsba=0
 			capabilities_l1dflush_no=0
 			capabilities_ssb_no=0
+			capabilities_pschange_msc_no=0
+			capabilities_tsx_ctrl_msr=0
 			if [ $val -eq 0 ]; then
+				# https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/arch/x86/include/asm/msr-index.h#n82
 				_debug "capabilities MSR is $capabilities (decimal)"
 				[ $(( capabilities >> 0 & 1 )) -eq 1 ] && capabilities_rdcl_no=1
 				[ $(( capabilities >> 1 & 1 )) -eq 1 ] && capabilities_ibrs_all=1
@@ -2637,8 +2813,10 @@ check_cpu()
 				[ $(( capabilities >> 3 & 1 )) -eq 1 ] && capabilities_l1dflush_no=1
 				[ $(( capabilities >> 4 & 1 )) -eq 1 ] && capabilities_ssb_no=1
 				[ $(( capabilities >> 5 & 1 )) -eq 1 ] && capabilities_mds_no=1
+				[ $(( capabilities >> 6 & 1 )) -eq 1 ] && capabilities_pschange_msc_no=1
+				[ $(( capabilities >> 7 & 1 )) -eq 1 ] && capabilities_tsx_ctrl_msr=1
 				[ $(( capabilities >> 8 & 1 )) -eq 1 ] && capabilities_taa_no=1
-				_debug "capabilities says rdcl_no=$capabilities_rdcl_no ibrs_all=$capabilities_ibrs_all rsba=$capabilities_rsba l1dflush_no=$capabilities_l1dflush_no ssb_no=$capabilities_ssb_no mds_no=$capabilities_mds_no taa_no=$capabilities_taa_no"
+				_debug "capabilities says rdcl_no=$capabilities_rdcl_no ibrs_all=$capabilities_ibrs_all rsba=$capabilities_rsba l1dflush_no=$capabilities_l1dflush_no ssb_no=$capabilities_ssb_no mds_no=$capabilities_mds_no taa_no=$capabilities_taa_no pschange_msc_no=$capabilities_pschange_msc_no"
 				if [ "$capabilities_ibrs_all" = 1 ]; then
 					if [ $cpu_mismatch -eq 0 ]; then
 						pstatus green YES
@@ -2652,6 +2830,8 @@ check_cpu()
 				pstatus yellow UNKNOWN "is msr kernel module available?"
 			elif [ $val -eq 201 ]; then
 				pstatus yellow UNKNOWN "missing tool, install either msr-tools or perl"
+			elif [ $val -eq 202 ]; then
+				pstatus yellow UNKNOWN "$msr_locked_down_msg"
 			else
 				pstatus yellow NO
 			fi
@@ -2702,7 +2882,7 @@ check_cpu()
 			pstatus yellow NO
 		fi
 
-		_info_nol "  * CPU explicitly indicates not being vulnerable to TSX Asynchrnonous Abort (TAA_NO): "
+		_info_nol "  * CPU explicitly indicates not being vulnerable to TSX Asynchronous Abort (TAA_NO): "
 		if [ "$capabilities_taa_no" = -1 ]; then
 			pstatus yellow UNKNOWN
 		elif [ "$capabilities_taa_no" = 1 ]; then
@@ -2710,6 +2890,67 @@ check_cpu()
 		else
 			pstatus yellow NO
 		fi
+
+		_info_nol "  * CPU explicitly indicates not being vulnerable to iTLB Multihit (PSCHANGE_MSC_NO): "
+		if [ "$capabilities_pschange_msc_no" = -1 ]; then
+			pstatus yellow UNKNOWN
+		elif [ "$capabilities_pschange_msc_no" = 1 ]; then
+			pstatus green YES
+		else
+			pstatus yellow NO
+		fi
+
+		_info_nol "  * CPU explicitly indicates having MSR for TSX control (TSX_CTRL_MSR): "
+		if [ "$capabilities_tsx_ctrl_msr" = -1 ]; then
+			pstatus yellow UNKNOWN
+		elif [ "$capabilities_tsx_ctrl_msr" = 1 ]; then
+			pstatus green YES
+		else
+			pstatus yellow NO
+		fi
+
+		if [ "$capabilities_tsx_ctrl_msr" = 1 ]; then
+			read_msr 0x122 0; ret=$?
+			if [ "$ret" = 0 ]; then
+				tsx_ctrl_msr=$read_msr_value
+				tsx_ctrl_msr_rtm_disable=$(( tsx_ctrl_msr >> 0 & 1 ))
+				tsx_ctrl_msr_cpuid_clear=$(( tsx_ctrl_msr >> 1 & 1 ))
+			fi
+
+			_info_nol "    * TSX_CTRL MSR indicates TSX RTM is disabled: "
+			if [ "$tsx_ctrl_msr_rtm_disable" = 1 ]; then
+				pstatus blue YES
+			elif [ "$tsx_ctrl_msr_rtm_disable" = 0 ]; then
+				pstatus blue NO
+			else
+				pstatus yellow UNKNOWN "couldn't read MSR"
+			fi
+
+			_info_nol "    * TSX_CTRL MSR indicates TSX CPUID bit is cleared: "
+			if [ "$tsx_ctrl_msr_cpuid_clear" = 1 ]; then
+				pstatus blue YES
+			elif [ "$tsx_ctrl_msr_cpuid_clear" = 0 ]; then
+				pstatus blue NO
+			else
+				pstatus yellow UNKNOWN "couldn't read MSR"
+			fi
+		fi
+	fi
+
+	_info_nol "  * CPU supports Transactional Synchronization Extensions (TSX): "
+	ret=1
+	cpuid_rtm=0
+	if is_intel; then
+		read_cpuid 0x7 $EBX 11 1 1; ret=$?
+	fi
+	if [ $ret -eq 0 ]; then
+		cpuid_rtm=1
+		pstatus green YES "RTM feature bit"
+	elif [ $ret -eq 2 ]; then
+		cpuid_rtm=-1
+		pstatus yellow UNKNOWN "is cpuid kernel module available?"
+	else
+		pstatus yellow NO
 	fi
 
 	_info_nol "  * CPU supports Software Guard Extensions (SGX): "
@@ -2789,6 +3030,64 @@ check_redhat_canonical_spectre()
 			redhat_canonical_spectre=2
 		else
 			redhat_canonical_spectre=0
+		fi
+	fi
+}
+
+check_has_vmm()
+{
+	_info_nol "* This system is a host running a hypervisor: "
+	has_vmm=$opt_vmm
+	if [ "$has_vmm" = -1 ] && [ "$opt_paranoid" = 1 ]; then
+		# In paranoid mode, if --vmm was not specified on the command-line,
+		# we want to be secure before everything else, so assume we're running
+		# a hypervisor, as this requires more mitigations
+		has_vmm=2
+	elif [ "$has_vmm" = -1 ]; then
+		# Here, we want to know if we are hosting a hypervisor, and running some VMs on it.
+		# If we find no evidence that this is the case, assume we're not (to avoid scaring users),
+		# this can always be overridden with --vmm in any case.
+		has_vmm=0
+		if command -v pgrep >/dev/null 2>&1; then
+			# remove xenbus and xenwatch, also present inside domU
+			# remove libvirtd as it can also be used to manage containers and not VMs
+			# for each binary we want to grep, get the pids
+			for _binary in qemu kvm xenstored xenconsoled
+			do
+				for _pid in $(pgrep $_binary)
+				do
+					# resolve the exe symlink, if it doesn't resolve with -m,
+					# which doesn't even need the dest to exist, it means the symlink
+					# is null, which is the case for kernel threads: ignore those to
+					# avoid false positives (such as [kvm-irqfd-clean] under at least RHEL 7.6/7.7)
+					if ! [ "$(readlink -m "/proc/$_pid/exe")" = "/proc/$_pid/exe" ]; then
+						_debug "has_vmm: found PID $_pid"
+						has_vmm=1
+					fi
+				done
+			done
+			unset _binary _pid
+		else
+			# ignore SC2009 as `ps ax` is actually used as a fallback if `pgrep` isn't installed
+			# shellcheck disable=SC2009
+			if ps ax | grep -vw grep | grep -q -e '\<qemu' -e '/qemu' -e '<\kvm' -e '/kvm' -e '/xenstored' -e '/xenconsoled'; then
+				has_vmm=1
+			fi
+		fi
+	fi
+	if [ "$has_vmm" = 0 ]; then
+		if [ "$opt_vmm" != -1 ]; then
+			pstatus green NO "forced from command line"
+		else
+			pstatus green NO
+		fi
+	else
+		if [ "$opt_vmm" != -1 ]; then
+			pstatus blue YES "forced from command line"
+		elif [ "$has_vmm" = 2 ]; then
+			pstatus blue YES "paranoid mode"
+		else
+			pstatus blue YES
 		fi
 	fi
 }
@@ -3973,8 +4272,10 @@ check_CVE_2018_3639_linux()
 
 			if [ "$kernel_ssbd_enabled" = 1 ]; then
 				_info_nol "* SSB mitigation currently active for selected processes: "
-				mitigated_processes=$(grep -El 'Speculation.?Store.?Bypass:[[:space:]]+thread (force )?mitigated' /proc/*/status \
-					| sed s/status/exe/ | xargs -r -n1 readlink -f | xargs -r -n1 basename | sort -u | tr "\n" " " | sed 's/ $//')
+				# silence grep's stderr here to avoid ENOENT errors from processes that have exited since the shell's expansion of the *
+				mitigated_processes=$(find /proc -mindepth 2 -maxdepth 2 -type f -name status -print0 2>/dev/null \
+					| xargs -r0 grep -El 'Speculation.?Store.?Bypass:[[:space:]]+thread (force )?mitigated' 2>/dev/null \
+					| sed s/status/exe/ | xargs -r -n1 readlink -f 2>/dev/null | xargs -r -n1 basename | sort -u | tr "\n" " " | sed 's/ $//')
 				if [ -n "$mitigated_processes" ]; then
 					pstatus green YES "$mitigated_processes"
 				else
@@ -4059,7 +4360,8 @@ check_CVE_2018_3639_bsd()
 				pvulnstatus $cve OK "SSBD mitigates the vulnerability"
 		elif [ -n "$cpuid_ssbd" ]; then
 			if [ "$kernel_ssb" = 1 ]; then
-				pvulnstatus $cve VULN "you need to enable ssbd through sysctl to mitigate the vulnerability"
+				pvulnstatus $cve VULN "you need to enable SSBD through sysctl to mitigate the vulnerability"
+				explain "To enable SSBD right now, you can run \`sysctl hw.spec_store_bypass_disable=2'. To make this change persistent across reboots, you can add 'sysctl hw.spec_store_bypass_disable=2' to /etc/sysctl.conf."
 			else
 				pvulnstatus $cve VULN "your kernel needs to be updated"
 			fi
@@ -4083,10 +4385,15 @@ check_CVE_2018_3615()
 	_info "\033[1;34m$cve aka '$(cve2name "$cve")'\033[0m"
 
 	_info_nol "* CPU microcode mitigates the vulnerability: "
-	if [ "$cpu_flush_cmd" = 1 ] && [ "$cpuid_sgx" = 1 ]; then
+	if { [ "$cpu_flush_cmd" = 1 ] || { [ "$msr_locked_down" = 1 ] && [ "$cpuid_l1df" = 1 ]; }; } && [ "$cpuid_sgx" = 1 ]; then
 		# no easy way to detect a fixed SGX but we know that
 		# microcodes that have the FLUSH_CMD MSR also have the
-		# fixed SGX (for CPUs that support it)
+		# fixed SGX (for CPUs that support it), because Intel
+		# delivered fixed microcodes for both issues at the same time
+		#
+		# if the system we're running on is locked down (no way to write MSRs),
+		# make the assumption that if the L1D flush CPUID bit is set, probably
+		# that FLUSH_CMD MSR is here too
 		pstatus green YES
 	elif [ "$cpuid_sgx" = 1 ]; then
 		pstatus red NO
@@ -4097,7 +4404,7 @@ check_CVE_2018_3615()
 	if ! is_cpu_vulnerable "$cve"; then
 		# override status & msg in case CPU is not vulnerable after all
 		pvulnstatus $cve OK "your CPU vendor reported your CPU model as not vulnerable"
-	elif [ "$cpu_flush_cmd" = 1 ]; then
+	elif [ "$cpu_flush_cmd" = 1 ] || { [ "$msr_locked_down" = 1 ] && [ "$cpuid_l1df" = 1 ]; } ; then
 		pvulnstatus $cve OK "your CPU microcode mitigates the vulnerability"
 	else
 		pvulnstatus $cve VULN "your CPU supports SGX and the microcode is not up to date"
@@ -4130,6 +4437,10 @@ check_CVE_2018_3620_linux()
 	if [ "$opt_sysfs_only" != 1 ]; then
 		_info_nol "* Kernel supports PTE inversion: "
 		if ! command -v "${opt_arch_prefix}strings" >/dev/null 2>&1; then
+			pstatus yellow UNKNOWN "missing 'strings' tool, please install it"
+			pteinv_supported=-1
+		elif [ -n "$kernel_err" ]; then
+			pstatus yellow UNKNOWN "$kernel_err"
 			pteinv_supported=-1
 		else
 			if "${opt_arch_prefix}strings" "$kernel" | grep -Fq 'PTE Inversion'; then
@@ -4241,48 +4552,7 @@ check_CVE_2018_3646_linux()
 	fi
 	l1d_mode=-1
 	if [ "$opt_sysfs_only" != 1 ]; then
-		_info_nol "* This system is a host running a hypervisor: "
-		has_vmm=$opt_vmm
-		if [ "$has_vmm" = -1 ] && [ "$opt_paranoid" = 1 ]; then
-			# In paranoid mode, if --vmm was not specified on the command-line,
-			# we want to be secure before everything else, so assume we're running
-			# a hypervisor, as this requires more mitigations
-			has_vmm=2
-		elif [ "$has_vmm" = -1 ]; then
-			# Here, we want to know if we are hosting a hypervisor, and running some VMs on it.
-			# If we find no evidence that this is the case, assume we're not (to avoid scaring users),
-			# this can always be overridden with --vmm in any case.
-			has_vmm=0
-			if command -v pgrep >/dev/null 2>&1; then
-				# remove xenbus and xenwatch, also present inside domU
-				# remove libvirtd as it can also be used to manage containers and not VMs
-				if pgrep qemu >/dev/null || pgrep kvm >/dev/null || \
-					pgrep xenstored >/dev/null || pgrep xenconsoled >/dev/null; then
-					has_vmm=1
-				fi
-			else
-				# ignore SC2009 as `ps ax` is actually used as a fallback if `pgrep` isn't installed
-				# shellcheck disable=SC2009
-				if ps ax | grep -vw grep | grep -q -e '\<qemu' -e '/qemu' -e '<\kvm' -e '/kvm' -e '/xenstored' -e '/xenconsoled'; then
-					has_vmm=1
-				fi
-			fi
-		fi
-		if [ "$has_vmm" = 0 ]; then
-			if [ "$opt_vmm" != -1 ]; then
-				pstatus green NO "forced from command line"
-			else
-				pstatus green NO
-			fi
-		else
-			if [ "$opt_vmm" != -1 ]; then
-				pstatus blue YES "forced from command line"
-			elif [ "$has_vmm" = 2 ]; then
-				pstatus blue YES "paranoid mode"
-			else
-				pstatus blue YES
-			fi
-		fi
+		check_has_vmm
 
 		_info "* Mitigation 1 (KVM)"
 		_info_nol "  * EPT is disabled: "
@@ -4610,6 +4880,7 @@ check_mds_bsd()
 						fi
 					else
 						pvulnstatus "$cve" VULN "Your microcode and kernel are both up to date for this mitigation, but the mitigation is not active"
+						explain "To enable mitigation, run \`sysctl hw.mds_disable=1'. To make this change persistent across reboots, you can add 'hw.mds_disable=1' to /etc/sysctl.conf."
 					fi
 				else
 					pvulnstatus "$cve" OK "Your microcode and kernel are both up to date for this mitigation"
@@ -4842,6 +5113,95 @@ check_CVE_2019_11135_linux()
 	fi
 }
 
+#######################
+# iTLB Multihit section
+
+check_CVE_2018_12207()
+{
+	cve='CVE-2018-12207'
+	_info "\033[1;34m$cve aka '$(cve2name "$cve")'\033[0m"
+	if [ "$os" = Linux ]; then
+		check_CVE_2018_12207_linux
+	#elif echo "$os" | grep -q BSD; then
+	#	check_CVE_2018_12207_bsd
+	else
+		_warn "Unsupported OS ($os)"
+	fi
+}
+
+check_CVE_2018_12207_linux()
+{
+	status=UNK
+	sys_interface_available=0
+	msg=''
+	if sys_interface_check "/sys/devices/system/cpu/vulnerabilities/itlb_multihit"; then
+		# this kernel has the /sys interface, trust it over everything
+		sys_interface_available=1
+	fi
+	if [ "$opt_sysfs_only" != 1 ]; then
+		check_has_vmm
+
+		_info_nol "* iTLB Multihit mitigation is supported by kernel: "
+		kernel_itlbmh=''
+		if [ -n "$kernel_err" ]; then
+			kernel_itlbmh_err="$kernel_err"
+		# commit 5219505fcbb640e273a0d51c19c38de0100ec5a9
+		elif grep -q 'itlb_multihit' "$kernel"; then
+			kernel_itlbmh="found itlb_multihit in kernel image"
+		fi
+		if [ -n "$kernel_itlbmh" ]; then
+			pstatus green YES "$kernel_itlbmh"
+		elif [ -n "$kernel_itlbmh_err" ]; then
+			pstatus yellow UNKNOWN "$kernel_itlbmh_err"
+		else
+			pstatus yellow NO
+		fi
+
+		_info_nol "* iTLB Multihit mitigation enabled and active: "
+		if [ "$opt_live" = 1 ]; then
+			if [ -n "$fullmsg" ]; then
+				if echo "$fullmsg" | grep -qF 'Mitigation'; then
+					pstatus green YES "$fullmsg"
+				else
+					pstatus yellow NO
+				fi
+			else
+				pstatus yellow NO "itlb_multihit not found in sysfs hierarchy"
+			fi
+		else
+			pstatus blue N/A "not testable in offline mode"
+		fi
+	elif [ "$sys_interface_available" = 0 ]; then
+		# we have no sysfs but were asked to use it only!
+		msg="/sys vulnerability interface use forced, but it's not available!"
+		status=UNK
+	fi
+
+	if ! is_cpu_vulnerable "$cve" ; then
+		# override status & msg in case CPU is not vulnerable after all
+		pvulnstatus "$cve" OK "your CPU vendor reported your CPU model as not vulnerable"
+	elif [ "$has_vmm" = 0 ]; then
+		pvulnstatus "$cve" OK "this system is not running a hypervisor"
+	elif [ -z "$msg" ]; then
+		# if msg is empty, sysfs check didn't fill it, rely on our own test
+		if [ "$opt_live" = 1 ]; then
+			# if we're in live mode and $msg is empty, sysfs file is not there so kernel is too old
+			pvulnstatus $cve VULN "Your kernel doesn't support iTLB Multihit mitigation, update it"
+		else
+			if [ -n "$kernel_itlbmh" ]; then
+				pvulnstatus $cve OK "Your kernel supports iTLB Multihit mitigation"
+			else
+				pvulnstatus $cve VULN "Your kernel doesn't support iTLB Multihit mitigation, update it"
+			fi
+		fi
+	else
+		pvulnstatus $cve "$status" "$msg"
+	fi
+}
+
+#######################
+# END OF VULNS SECTIONS
+
 if [ "$opt_no_hw" = 0 ] && [ -z "$opt_arch_prefix" ]; then
 	check_cpu
 	check_cpu_vulnerabilities
@@ -4928,13 +5288,10 @@ fi
 exit 0  # ok
 
 # We're using MCE.db from the excellent platomav's MCExtractor project
-# The builtin version follows, but the user can download an up-to-date copy (to be stored in his $HOME) by using --update-mcedb
-# To update the builtin version itself (by *modifying* this very file), use --update-builtin-mcedb
+# The builtin version follows, but the user can download an up-to-date copy (to be stored in his $HOME) by using --update-fwdb
+# To update the builtin version itself (by *modifying* this very file), use --update-builtin-fwdb
 
-# wget https://github.com/platomav/MCExtractor/raw/master/MCE.db
-# sqlite3 MCE.db "select '%%% MCEDB v'||revision||' - '||strftime('%Y/%m/%d', date, 'unixepoch') from MCE; select '# I,0x'||cpuid||',0x'||version||','||max(yyyymmdd) from Intel group by cpuid order by cpuid asc; select '# A,0x'||cpuid||',0x'||version||','||max(yyyymmdd) from AMD group by cpuid order by cpuid asc"
-
-# %%% MCEDB v130 - 2019/11/04
+# %%% MCEDB v130.20191104+i20191027
 # I,0x00000611,0x00000B27,19961218
 # I,0x00000612,0x000000C6,19961210
 # I,0x00000616,0x000000C6,19961210
@@ -4944,28 +5301,28 @@ exit 0  # ok
 # I,0x00000632,0x00000020,19960903
 # I,0x00000633,0x00000036,19980923
 # I,0x00000634,0x00000037,19980923
-# I,0x00000650,0x00000040,19990525
-# I,0x00000651,0x00000040,19990525
+# I,0x00000650,0x00000045,19990525
+# I,0x00000651,0x00000042,19990525
 # I,0x00000652,0x0000002D,19990518
 # I,0x00000653,0x00000010,19990628
 # I,0x00000660,0x0000000A,19990505
 # I,0x00000665,0x00000003,19990505
-# I,0x0000066A,0x0000000C,19990505
+# I,0x0000066A,0x0000000D,19990505
 # I,0x0000066D,0x00000007,19990505
 # I,0x00000670,0x00000007,19980602
-# I,0x00000671,0x00000003,19980811
-# I,0x00000672,0x00000010,19990922
-# I,0x00000673,0x0000000E,19990910
-# I,0x00000680,0x00000014,19990610
+# I,0x00000671,0x00000014,19980811
+# I,0x00000672,0x00000038,19990922
+# I,0x00000673,0x0000002E,19990910
+# I,0x00000680,0x00000017,19990610
 # I,0x00000681,0x00000014,19991209
-# I,0x00000683,0x00000013,20010206
-# I,0x00000686,0x00000007,20000505
-# I,0x0000068A,0x00000004,20001207
+# I,0x00000683,0x00000014,20010206
+# I,0x00000686,0x00000008,20000505
+# I,0x0000068A,0x00000005,20001207
 # I,0x00000690,0x00000004,20000206
 # I,0x00000691,0x00000001,20020527
 # I,0x00000692,0x00000001,20020620
 # I,0x00000694,0x00000002,20020926
-# I,0x00000695,0x00000007,20041109
+# I,0x00000695,0x00000047,20041109
 # I,0x00000696,0x00000001,20000707
 # I,0x000006A0,0x00000003,20000110
 # I,0x000006A1,0x00000001,20000306
@@ -4989,7 +5346,7 @@ exit 0  # ok
 # I,0x000006F4,0x00000028,20060417
 # I,0x000006F5,0x00000039,20060727
 # I,0x000006F6,0x000000D2,20101001
-# I,0x000006F7,0x0000006A,20101002
+# I,0x000006F7,0x0000006B,20101002
 # I,0x000006F9,0x00000084,20061012
 # I,0x000006FA,0x00000095,20101002
 # I,0x000006FB,0x000000C1,20111004
@@ -4999,24 +5356,24 @@ exit 0  # ok
 # I,0x00000F02,0xFFFF000B,20000518
 # I,0x00000F03,0xFFFF0001,20000518
 # I,0x00000F04,0xFFFF0010,20000803
-# I,0x00000F05,0x0000000B,20000824
+# I,0x00000F05,0x0000000C,20000824
 # I,0x00000F06,0x00000004,20000911
 # I,0x00000F07,0x00000012,20020716
 # I,0x00000F08,0x00000008,20001101
 # I,0x00000F09,0x00000008,20010104
 # I,0x00000F0A,0x00000015,20020821
 # I,0x00000F11,0x0000000A,20030729
-# I,0x00000F12,0x0000002D,20030502
+# I,0x00000F12,0x0000002F,20030502
 # I,0x00000F13,0x00000005,20030508
 # I,0x00000F20,0x00000001,20010423
-# I,0x00000F21,0x00000002,20010529
+# I,0x00000F21,0x00000003,20010529
 # I,0x00000F22,0x00000005,20030729
 # I,0x00000F23,0x0000000D,20010817
 # I,0x00000F24,0x00000021,20030610
 # I,0x00000F25,0x0000002C,20040826
 # I,0x00000F26,0x00000010,20040805
-# I,0x00000F27,0x00000038,20030604
-# I,0x00000F29,0x0000002D,20040811
+# I,0x00000F27,0x00000039,20030604
+# I,0x00000F29,0x0000002F,20040811
 # I,0x00000F30,0x00000013,20030815
 # I,0x00000F31,0x0000000B,20031021
 # I,0x00000F32,0x0000000A,20040511
@@ -5045,7 +5402,7 @@ exit 0  # ok
 # I,0x00001632,0x00000002,19980610
 # I,0x00010650,0x00000002,20060513
 # I,0x00010660,0x00000004,20060612
-# I,0x00010661,0x00000043,20101004
+# I,0x00010661,0x00000045,20101004
 # I,0x00010670,0x00000005,20070209
 # I,0x00010671,0x00000106,20070329
 # I,0x00010674,0x84050100,20070726
@@ -5059,7 +5416,7 @@ exit 0  # ok
 # I,0x000106A5,0x0000001D,20180511
 # I,0x000106C0,0x00000007,20070824
 # I,0x000106C1,0x00000109,20071203
-# I,0x000106C2,0x00000217,20090410
+# I,0x000106C2,0x00000219,20090410
 # I,0x000106C9,0x00000007,20090213
 # I,0x000106CA,0x00000107,20090825
 # I,0x000106D0,0x00000005,20071204
@@ -5155,17 +5512,17 @@ exit 0  # ok
 # I,0x000406C3,0x00000368,20190423
 # I,0x000406C4,0x00000411,20190423
 # I,0x000406D0,0x0000000E,20130612
-# I,0x000406D8,0x0000012A,20180104
+# I,0x000406D8,0x0000012D,20190916
 # I,0x000406E1,0x00000020,20141111
 # I,0x000406E2,0x0000002C,20150521
-# I,0x000406E3,0x000000D4,20190814
+# I,0x000406E3,0x000000D6,20191003
 # I,0x000406E8,0x00000026,20160414
 # I,0x000406F0,0x00000014,20150702
 # I,0x000406F1,0x0B000038,20190618
 # I,0x00050650,0x8000002B,20160208
 # I,0x00050651,0x8000002B,20160208
 # I,0x00050652,0x80000037,20170502
-# I,0x00050653,0x01000146,20180824
+# I,0x00050653,0x01000151,20190909
 # I,0x00050654,0x02000065,20190905
 # I,0x00050655,0x03000012,20190412
 # I,0x00050656,0x0400002C,20190905
@@ -5186,7 +5543,7 @@ exit 0  # ok
 # I,0x000506E0,0x00000018,20141119
 # I,0x000506E1,0x0000002A,20150602
 # I,0x000506E2,0x0000002E,20150815
-# I,0x000506E3,0x000000D4,20190814
+# I,0x000506E3,0x000000D6,20191003
 # I,0x000506E8,0x00000034,20160710
 # I,0x000506F0,0x00000010,20160607
 # I,0x000506F1,0x0000002E,20190321
@@ -5204,17 +5561,17 @@ exit 0  # ok
 # I,0x000706E4,0x00000036,20190718
 # I,0x000706E5,0x00000050,20191027
 # I,0x00080650,0x00000018,20180108
-# I,0x000806E9,0x000000C8,20191003
-# I,0x000806EA,0x000000C6,20190814
-# I,0x000806EB,0x000000C6,20190814
-# I,0x000806EC,0x000000C6,20190814
-# I,0x000906E9,0x000000C6,20190814
-# I,0x000906EA,0x000000C6,20190814
-# I,0x000906EB,0x000000C6,20190814
-# I,0x000906EC,0x000000C6,20190814
-# I,0x000906ED,0x000000C6,20190814
+# I,0x000806E9,0x000000CA,20191015
+# I,0x000806EA,0x000000CA,20191003
+# I,0x000806EB,0x000000CA,20191003
+# I,0x000806EC,0x000000CA,20191003
+# I,0x000906E9,0x000000CA,20191003
+# I,0x000906EA,0x000000CA,20191003
+# I,0x000906EB,0x000000CA,20191003
+# I,0x000906EC,0x000000CA,20191003
+# I,0x000906ED,0x000000CA,20191003
 # I,0x000A0650,0x000000AE,20190410
-# I,0x000A0660,0x000000C6,20190827
+# I,0x000A0660,0x000000CA,20191003
 # A,0x00000F00,0x02000008,20070614
 # A,0x00000F01,0x0000001C,20021031
 # A,0x00000F10,0x00000003,20020325
