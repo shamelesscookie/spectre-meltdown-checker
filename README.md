@@ -16,6 +16,7 @@ A shell script to tell if your system is vulnerable against the several "specula
 - CVE-2019-11091 [microarchitectural data sampling uncacheable memory (MDSUM)] aka 'RIDL'
 - CVE-2019-11135 [TSX asynchronous abort] aka 'TAA' aka 'ZombieLoad V2'
 - CVE-2018-12207 [machine check exception on page size changes (MCEPSC)] aka 'No eXcuses' aka 'iTLB Multihit'
+- CVE-2020-0543 [Special Register Buffer Data Sampling (SRBDS)]
 
 Supported operating systems:
 - Linux (all versions, flavors and distros)
@@ -159,9 +160,15 @@ docker run --rm --privileged -v /boot:/boot:ro -v /dev/cpu:/dev/cpu:ro -v /lib/m
    - Mitigation: disable hugepages use in hypervisor, or update hypervisor to benefit from mitigation
    - Performance impact of the mitigation: low to significant
 
+**CVE-2020-0543** Special Register Buffer Data Sampling (SRBDS)
+
+   - Impact: Kernel
+   - Mitigation: microcode update + kernel update helping to protect various CPU internal buffers from unprivileged speculative access to data
+   - Performance impact of the mitigation: low
+
 ## Understanding what this script does and doesn't
 
-This tool does its best to determine whether your system is immune (or has proper mitigations in place) for the collectively named "speculative execution" vulnerabilities. It doesn't attempt to run any kind of exploit, and can't guarantee that your system is secure, but rather helps you verifying whether your system has the known correct mitigations in place.
+This tool does its best to determine whether your system is affected (or has proper mitigations in place) by the collectively named "speculative execution" vulnerabilities. It doesn't attempt to run any kind of exploit, and can't guarantee that your system is secure, but rather helps you verifying whether your system has the known mitigations in place.
 However, some mitigations could also exist in your kernel that this script doesn't know (yet) how to detect, or it might falsely detect mitigations that in the end don't work as expected (for example, on backported or modified kernels).
 
 Your system exposure also depends on your CPU. As of now, AMD and ARM processors are marked as immune to some or all of these vulnerabilities (except some specific ARM models). All Intel processors manufactured since circa 1995 are thought to be vulnerable, except some specific/old models, such as some early Atoms. Whatever processor one uses, one might seek more information from the manufacturer of that processor and/or of the device in which it runs.
